@@ -1,0 +1,35 @@
+data:
+  data_dir: data
+  datasets: mixed       # matr | nasa | mixed
+  seq_len: 320
+  max_gap: 10
+  val_fraction: 0.15
+  test_fraction: 0.15
+  batch_size: 64
+  num_workers: 4
+  stride: 160
+  processed_dir_name: processed  # processed | half_processed
+
+model:
+  seq_len: ${data.seq_len}
+  patch_size: 32
+  strides: 16
+  num_channels: 3
+  embed_dim: 128
+  enc_nhead: 4
+  enc_layers: 2
+  pred_nhead: 4
+  pred_layers: 1
+  sigreg_lambda: 0.05
+  sigreg_knots: 17
+  sigreg_num_proj: 1024
+  lr: 1e-3
+  weight_decay: 0.00
+  warmup_epochs: 10
+
+trainer:
+  max_epochs: 1000
+  accelerator: auto
+  devices: auto
+  patience: 30
+  seed: 42
