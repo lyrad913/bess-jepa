@@ -1,0 +1,27 @@
+checkpoint: ???
+
+data:
+  data_dir: data
+  datasets: mixed       # matr | nasa | mixed
+  seq_len: null         # null이면 checkpoint hparams.seq_len 사용
+  batch_size: 64
+  num_workers: 4
+  stride: 20
+  rollout_steps: null   # null이면 test segment 끝까지 rollout
+  processed_dir_name: processed  # processed | half_processed
+
+probe:
+  lr: 1e-3
+  weight_decay: 0.0
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: auto
+  patience: 15
+  seed: 42
+
+report:
+  dir: forecast_reports
+  plot_batches: 2
+  use_clearml: true

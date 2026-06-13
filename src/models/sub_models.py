@@ -34,8 +34,8 @@ class Tokenizer(nn.Module):
         """
         x: (batch_size, n_feature, seq_len)
         """
-        if x.shape[-1] != self.seq_len:
-            raise ValueError(f"expected seq_len={self.seq_len}, got {x.shape[-1]}")
+        if x.shape[-1] < self.patch_len:
+            raise ValueError(f"expected length >= patch_len={self.patch_len}, got {x.shape[-1]}")
 
         x = x.unfold(-1, self.patch_len, self.strides)  # (batch, n_features, n_patches, patch_len)
         x = rearrange(x, "b c n p -> b n (p c)")        # (batch, n_patches, patch_len * n_features)
@@ -122,17 +122,21 @@ class SIGReg(torch.nn.Module):
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
 
-
 class Decoder(nn.Module):
-    """Linear reconstruction head: (B, N, D) → (B, N, P*C)"""
-
-    def __init__(self, embed_dim: int, patch_size: int, num_channels: int):
+    """Linear reconstruction head: 
+    (batch_size, n_patches, embed_dim)
+    -> (batch_size, n_features, seq_len)
+    """
+    def __init__(self, n_patches, embed_dim, n_features, seq_len):
         super().__init__()
-        self.fc = nn.Linear(embed_dim, patch_size * num_channels)
+        self.n_features = n_features
+        self.seq_len = seq_len
+        self.fc = nn.Linear(n_patches * embed_dim, n_features*seq_len)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x)
-    
+        x = rearrange(x, "b n d -> b (n d)")
+        x = self.fc(x)
+        return rearrange(x, "b (n c) -> b n c", n=self.n_features, c=self.seq_len)    
     
     
 class RoPE(nn.Module):

@@ -73,7 +73,7 @@ class JEPA(L.LightningModule):
         pred_emb = self.predictor(ctx_emb, gap)
 
         # Loss
-        pred_loss = (pred_emb - tgt_emb).pow(2).mean()
+        pred_loss = F.smooth_l1_loss(pred_emb, tgt_emb)
         ce = rearrange(ctx_emb, 'b n d -> n b d')
         te = rearrange(tgt_emb, 'b n d -> n b d')
         sigreg_loss = 0.5 * self.sigreg(ce) + 0.5 * self.sigreg(te)

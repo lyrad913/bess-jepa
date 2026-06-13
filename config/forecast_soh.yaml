@@ -1,0 +1,28 @@
+checkpoint: ???
+
+data:
+  data_dir: data
+  seq_len: null          # null이면 checkpoint hparams.seq_len 사용
+  batch_size: 64
+  num_workers: 4
+  stride: null
+  processed_dir_name: processed
+  operations: discharge
+  max_horizon: null      # null이면 가능한 모든 미래 cycle pair 사용
+  horizon_stride: 1
+  dt_scale: 300.0
+
+probe:
+  lr: 1e-3
+  weight_decay: 0.0
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: auto
+  patience: 50
+  seed: 42
+
+report:
+  dir: forecast_soh_reports
+  use_clearml: true
