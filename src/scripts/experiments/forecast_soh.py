@@ -26,6 +26,7 @@ sys.path.insert(0, str(SRC_DIR / "data"))
 
 from forecast_soh_loader import ForecastSohLoader
 from jepa import JEPA
+from sub_models import Encoder, Tokenizer
 
 SOH_PERCENT_SCALE = 100.0
 
@@ -35,23 +36,26 @@ class ForecastSohProbe(L.LightningModule):
 
     def __init__(
         self,
-        jepa: JEPA,
+        tokenizer: torch.nn.Module,
+        encoder: torch.nn.Module,
+        embed_dim: int,
+        train_encoder: bool,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
         dt_scale: float = 300.0,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(ignore=["jepa"])
+        self.save_hyperparameters(ignore=["tokenizer", "encoder"])
 
-        self.tokenizer = jepa.tokenizer
-        self.encoder = jepa.encoder
+        self.tokenizer = tokenizer
+        self.encoder = encoder
+        self.train_encoder = train_encoder
         for p in self.tokenizer.parameters():
-            p.requires_grad = False
+            p.requires_grad = train_encoder
         for p in self.encoder.parameters():
-            p.requires_grad = False
+            p.requires_grad = train_encoder
 
-        hp = jepa.hparams
-        embed_dim = int(hp.embed_dim)
+        embed_dim = int(embed_dim)
         self.dt_embed = nn.Sequential(
             nn.Linear(2, embed_dim),
             nn.GELU(),
@@ -62,11 +66,15 @@ class ForecastSohProbe(L.LightningModule):
     def encode_segment(self, segment: torch.Tensor) -> torch.Tensor:
         if segment.ndim != 2:
             raise ValueError(f"expected segment shape (C, T), got {tuple(segment.shape)}")
-        self.tokenizer.eval()
-        self.encoder.eval()
-        with torch.no_grad():
+        if self.train_encoder:
             tokens = self.tokenizer(segment.to(self.device).unsqueeze(0))
             z = self.encoder(tokens)
+        else:
+            self.tokenizer.eval()
+            self.encoder.eval()
+            with torch.no_grad():
+                tokens = self.tokenizer(segment.to(self.device).unsqueeze(0))
+                z = self.encoder(tokens)
         return z.mean(dim=1).squeeze(0)
 
     def _dt_features(self, delta_cycle: torch.Tensor) -> torch.Tensor:
@@ -115,23 +123,27 @@ class ForecastSohProbe(L.LightningModule):
         self._step(batch, "test")
 
     def configure_optimizers(self):
+        params = list(self.dt_embed.parameters()) + list(self.head.parameters())
+        if self.train_encoder:
+            params = list(self.tokenizer.parameters()) + list(self.encoder.parameters()) + params
         return torch.optim.AdamW(
-            list(self.dt_embed.parameters()) + list(self.head.parameters()),
+            params,
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
 
 
-def train(cfg: DictConfig) -> tuple[ForecastSohProbe, L.Trainer, ForecastSohLoader, str]:
-    # Pretrained JEPA와 future-SoH datamodule 준비
+def train(cfg: DictConfig, variant: str) -> tuple[ForecastSohProbe, L.Trainer, ForecastSohLoader, str]:
+    # Variant별 tokenizer/encoder와 future-SoH datamodule 준비
     device = "cuda" if torch.cuda.is_available() else "cpu"
     jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
     jepa.eval()
+    hp = jepa.hparams
 
-    seq_len = cfg.data.seq_len or int(jepa.hparams.seq_len)
-    if seq_len != int(jepa.hparams.seq_len):
+    seq_len = cfg.data.seq_len or int(hp.seq_len)
+    if seq_len != int(hp.seq_len):
         raise ValueError(
-            f"Forecast SoH seq_len={seq_len} must match checkpoint seq_len={int(jepa.hparams.seq_len)}"
+            f"Forecast SoH seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}"
         )
 
     dm = ForecastSohLoader(
@@ -144,13 +156,35 @@ def train(cfg: DictConfig) -> tuple[ForecastSohProbe, L.Trainer, ForecastSohLoad
         operations=cfg.data.operations,
         max_horizon=cfg.data.max_horizon,
         horizon_stride=cfg.data.horizon_stride,
-        min_segment_len=int(jepa.hparams.patch_size),
+        min_segment_len=int(hp.patch_size),
     )
     dm.setup()
 
-    # Frozen JEPA representation과 delta-cycle condition head 학습
+    pretrained = variant.startswith("pretrained")
+    train_encoder = variant in {"random_supervised", "pretrained_finetune"}
+    if pretrained:
+        tokenizer = jepa.tokenizer
+        encoder = jepa.encoder
+    else:
+        tokenizer = Tokenizer(
+            seq_len=int(hp.seq_len),
+            patch_len=int(hp.patch_size),
+            strides=int(hp.strides),
+            n_features=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+        )
+        encoder = Encoder(
+            embed_dim=int(hp.embed_dim),
+            nhead=int(hp.enc_nhead),
+            num_layers=int(hp.enc_layers),
+        )
+
+    # Variant 조건에 따라 encoder를 freeze하거나 supervised로 같이 학습
     model = ForecastSohProbe(
-        jepa,
+        tokenizer=tokenizer,
+        encoder=encoder,
+        embed_dim=int(hp.embed_dim),
+        train_encoder=train_encoder,
         lr=cfg.probe.lr,
         weight_decay=cfg.probe.weight_decay,
         dt_scale=cfg.data.dt_scale,
@@ -161,7 +195,7 @@ def train(cfg: DictConfig) -> tuple[ForecastSohProbe, L.Trainer, ForecastSohLoad
         devices=cfg.trainer.devices,
         callbacks=[
             EarlyStopping(monitor="val/rmse", patience=cfg.trainer.patience, mode="min"),
-            ModelCheckpoint(monitor="val/rmse", mode="min", save_top_k=1, filename="forecast-soh-probe-best"),
+            ModelCheckpoint(monitor="val/rmse", mode="min", save_top_k=1, filename=f"forecast-soh-{variant}-best"),
         ],
     )
     trainer.fit(model, dm)
@@ -171,7 +205,8 @@ def train(cfg: DictConfig) -> tuple[ForecastSohProbe, L.Trainer, ForecastSohLoad
     if trainer.checkpoint_callback.best_model_path:
         model = ForecastSohProbe.load_from_checkpoint(
             trainer.checkpoint_callback.best_model_path,
-            jepa=jepa,
+            tokenizer=tokenizer,
+            encoder=encoder,
             map_location=device,
         )
     model.to(device)
@@ -182,6 +217,7 @@ def do_bench(
     model: ForecastSohProbe,
     dm: ForecastSohLoader,
     device: str,
+    variant: str,
     task,
     report_dir: Path,
 ) -> dict[str, float]:
@@ -215,7 +251,7 @@ def do_bench(
     if task is not None:
         logger = task.get_logger()
         for key, value in metrics.items():
-            logger.report_single_value(key, value)
+            logger.report_single_value(f"{variant}/{key}", value)
     (report_dir / "final_summary.json").write_text(json.dumps(metrics, indent=2))
 
     # Predicted future SoH vs target future SoH 그림
@@ -230,10 +266,14 @@ def do_bench(
     ax.grid(True, alpha=0.25)
     ax.legend()
     fig.tight_layout()
+    fig.savefig(report_dir / "pred_vs_target.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast SoH", "pred_vs_target", fig, 0)
-    else:
-        fig.savefig(report_dir / "pred_vs_target.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(
+            f"Forecast SoH/{variant}/pred_vs_target",
+            "figure",
+            fig,
+            0,
+        )
     plt.close(fig)
 
     # Target cycle 기준 target/prediction 변화 그림
@@ -247,10 +287,14 @@ def do_bench(
     ax.grid(True, alpha=0.25)
     ax.legend()
     fig.tight_layout()
+    fig.savefig(report_dir / "target_cycle_plot.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast SoH", "target_cycle_plot", fig, 0)
-    else:
-        fig.savefig(report_dir / "target_cycle_plot.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(
+            f"Forecast SoH/{variant}/target_cycle_plot",
+            "figure",
+            fig,
+            0,
+        )
     plt.close(fig)
 
     # Horizon이 길어질 때 absolute error가 어떻게 변하는지 확인
@@ -261,10 +305,14 @@ def do_bench(
     ax.set_title("Future SoH Error by Horizon")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
+    fig.savefig(report_dir / "error_by_horizon.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast SoH", "error_by_horizon", fig, 0)
-    else:
-        fig.savefig(report_dir / "error_by_horizon.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(
+            f"Forecast SoH/{variant}/error_by_horizon",
+            "figure",
+            fig,
+            0,
+        )
     plt.close(fig)
 
     return metrics
@@ -291,16 +339,70 @@ def main(cfg: DictConfig) -> None:
         except Exception as e:
             print(f"ClearML 사용 불가: {e}")
 
-    # 모델 학습 후 best checkpoint로 벤치 실행
-    model, trainer, dm, device = train(cfg)
-    metrics = do_bench(model, dm, device, task, report_dir)
+    # 네 가지 encoder 조건에 대해 같은 downstream 실험 실행
+    variants = [
+        "pretrained_frozen",
+        "random_frozen",
+        "random_supervised",
+        "pretrained_finetune",
+    ]
+    comparison: dict[str, dict[str, float]] = {}
+    best_paths: dict[str, str] = {}
+    for variant in variants:
+        print(f"\n=== forecast SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        model, trainer, dm, device = train(cfg, variant)
+        comparison[variant] = do_bench(model, dm, device, variant, task, variant_dir)
+        if trainer.checkpoint_callback.best_model_path:
+            best_paths[variant] = trainer.checkpoint_callback.best_model_path
+
+    # Variant별 scalar 비교 표와 그림 저장
+    key_order = sorted({key for metrics in comparison.values() for key in metrics})
+    comparison_rows = [
+        {"variant": variant, **{key: comparison[variant].get(key, float("nan")) for key in key_order}}
+        for variant in variants
+    ]
+    (report_dir / "comparison_summary.json").write_text(json.dumps(comparison_rows, indent=2))
+    with (report_dir / "comparison_summary.csv").open("w") as f:
+        f.write("variant," + ",".join(key_order) + "\n")
+        for row in comparison_rows:
+            f.write(str(row["variant"]) + "," + ",".join(str(row[key]) for key in key_order) + "\n")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_keys = [key for key in ["test/rmse", "test/mae"] if key in key_order]
+    if plot_keys:
+        fig, axes = plt.subplots(len(plot_keys), 1, figsize=(9, 3.2 * len(plot_keys)), squeeze=False)
+        x = np.arange(len(variants))
+        for row, key in enumerate(plot_keys):
+            ax = axes[row, 0]
+            values = [comparison[variant].get(key, np.nan) for variant in variants]
+            ax.bar(x, values, color=["tab:blue", "tab:orange", "tab:green", "tab:red"])
+            ax.set_xticks(x, variants, rotation=20, ha="right")
+            ax.set_title(key)
+            ax.grid(True, axis="y", alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(report_dir / "variant_comparison.png", dpi=150, bbox_inches="tight")
+        if task is not None:
+            task.get_logger().report_matplotlib_figure("Forecast SoH", "variant_comparison", fig, 0)
+        plt.close(fig)
+
+    if task is not None:
+        logger = task.get_logger()
+        for variant, metrics in comparison.items():
+            for key, value in metrics.items():
+                logger.report_single_value(f"{variant}/{key}", value)
 
     print(f"forecast SoH reports saved under {report_dir}")
-    print("final summary:")
-    for key, value in metrics.items():
-        print(f"  {key}: {value:.6f}")
-    if trainer.checkpoint_callback.best_model_path:
-        print(f"best probe checkpoint: {trainer.checkpoint_callback.best_model_path}")
+    print("comparison summary:")
+    for variant in variants:
+        compact = {key: comparison[variant][key] for key in ["test/rmse", "test/mae"] if key in comparison[variant]}
+        print(f"  {variant}: {compact}")
+    for variant, path in best_paths.items():
+        print(f"best probe checkpoint [{variant}]: {path}")
 
 
 if __name__ == "__main__":

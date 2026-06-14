@@ -2,7 +2,7 @@ checkpoint: ???
 
 data:
   data_dir: data
-  seq_len: null          # null이면 checkpoint hparams.seq_len 사용
+  seq_len: 30          # null이면 checkpoint hparams.seq_len 사용
   batch_size: 64
   num_workers: 4
   stride: null
@@ -17,7 +17,7 @@ probe:
   weight_decay: 0.0
 
 trainer:
-  max_epochs: 100
+  max_epochs: 300
   accelerator: auto
   devices: auto
   patience: 50

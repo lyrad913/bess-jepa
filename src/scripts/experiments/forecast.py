@@ -25,7 +25,7 @@ sys.path.insert(0, str(SRC_DIR / "data"))
 
 from forecast_loader import FEATURES, ForecastLoader
 from jepa import JEPA
-from sub_models import Decoder
+from sub_models import Decoder, Encoder, Tokenizer
 
 
 class ForecastProbe(L.LightningModule):
@@ -33,35 +33,46 @@ class ForecastProbe(L.LightningModule):
 
     def __init__(
         self,
-        jepa: JEPA,
+        tokenizer: torch.nn.Module,
+        encoder: torch.nn.Module,
+        seq_len: int,
+        patch_size: int,
+        strides: int,
+        num_channels: int,
+        embed_dim: int,
+        train_encoder: bool,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(ignore=["jepa"])
-        self.tokenizer = jepa.tokenizer
-        self.encoder = jepa.encoder
+        self.save_hyperparameters(ignore=["tokenizer", "encoder"])
+        self.tokenizer = tokenizer
+        self.encoder = encoder
+        self.train_encoder = train_encoder
 
         for p in self.tokenizer.parameters():
-            p.requires_grad = False
+            p.requires_grad = train_encoder
         for p in self.encoder.parameters():
-            p.requires_grad = False
+            p.requires_grad = train_encoder
 
-        hp = jepa.hparams
-        n_patches = (hp.seq_len - hp.patch_size) // hp.strides + 1
+        n_patches = (seq_len - patch_size) // strides + 1
         self.decoder = Decoder(
             n_patches=n_patches,
-            embed_dim=hp.embed_dim,
-            n_features=hp.num_channels,
-            seq_len=hp.seq_len,
+            embed_dim=embed_dim,
+            n_features=num_channels,
+            seq_len=seq_len,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.tokenizer.eval()
-        self.encoder.eval()
-        with torch.no_grad():
+        if self.train_encoder:
             tokens = self.tokenizer(x)
             z = self.encoder(tokens)
+        else:
+            self.tokenizer.eval()
+            self.encoder.eval()
+            with torch.no_grad():
+                tokens = self.tokenizer(x)
+                z = self.encoder(tokens)
         return self.decoder(z)
 
     def _step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
@@ -92,23 +103,31 @@ class ForecastProbe(L.LightningModule):
         self._step(batch, "test")
 
     def configure_optimizers(self):
+        params = list(self.decoder.parameters())
+        if self.train_encoder:
+            params = list(self.tokenizer.parameters()) + list(self.encoder.parameters()) + params
         return torch.optim.AdamW(
-            self.decoder.parameters(),
+            params,
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
 
 
-def train(cfg: DictConfig) -> tuple[ForecastProbe, L.Trainer, ForecastLoader, str, list[dict[str, float]]]:
-    # Pretrained JEPA와 forecasting datamodule 준비
+def train(
+    cfg: DictConfig,
+    variant: str,
+    warm_start_ckpt: str | None = None,
+) -> tuple[ForecastProbe, L.Trainer, ForecastLoader, str, list[dict[str, float]]]:
+    # Variant별 tokenizer/encoder와 forecasting datamodule 준비
     device = "cuda" if torch.cuda.is_available() else "cpu"
     jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
     jepa.eval()
+    hp = jepa.hparams
 
-    seq_len = cfg.data.seq_len or int(jepa.hparams.seq_len)
-    if seq_len != int(jepa.hparams.seq_len):
+    seq_len = cfg.data.seq_len or int(hp.seq_len)
+    if seq_len != int(hp.seq_len):
         raise ValueError(
-            f"Forecast seq_len={seq_len} must match checkpoint seq_len={int(jepa.hparams.seq_len)}"
+            f"Forecast seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}"
         )
 
     dm = ForecastLoader(
@@ -123,25 +142,84 @@ def train(cfg: DictConfig) -> tuple[ForecastProbe, L.Trainer, ForecastLoader, st
     )
     dm.setup()
 
-    # Frozen JEPA 위에 decoder probe만 학습
-    model = ForecastProbe(jepa, lr=cfg.probe.lr, weight_decay=cfg.probe.weight_decay)
+    pretrained = variant.startswith("pretrained")
+    train_encoder = variant in {"random_supervised", "pretrained_finetune"}
+    if pretrained:
+        tokenizer = jepa.tokenizer
+        encoder = jepa.encoder
+    else:
+        tokenizer = Tokenizer(
+            seq_len=int(hp.seq_len),
+            patch_len=int(hp.patch_size),
+            strides=int(hp.strides),
+            n_features=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+        )
+        encoder = Encoder(
+            embed_dim=int(hp.embed_dim),
+            nhead=int(hp.enc_nhead),
+            num_layers=int(hp.enc_layers),
+        )
+
+    # Variant 조건에 따라 encoder를 freeze하거나 supervised로 같이 학습
+    lr = 1e-4 if variant == "pretrained_finetune" else cfg.probe.lr
+    model = ForecastProbe(
+        tokenizer=tokenizer,
+        encoder=encoder,
+        seq_len=int(hp.seq_len),
+        patch_size=int(hp.patch_size),
+        strides=int(hp.strides),
+        num_channels=int(hp.num_channels),
+        embed_dim=int(hp.embed_dim),
+        train_encoder=train_encoder,
+        lr=lr,
+        weight_decay=cfg.probe.weight_decay,
+    )
+    if variant == "pretrained_finetune":
+        if warm_start_ckpt is None:
+            raise RuntimeError("pretrained_finetune requires pretrained_frozen best checkpoint")
+        checkpoint = torch.load(warm_start_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        print(f"[{variant}] warm-start from pretrained_frozen checkpoint: {warm_start_ckpt}")
+    encoder_params = list(model.tokenizer.parameters()) + list(model.encoder.parameters())
+    encoder_trainable = sum(p.numel() for p in encoder_params if p.requires_grad)
+    probe_trainable = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
+    print(
+        f"[{variant}] lr={lr} train_encoder={train_encoder} "
+        f"encoder_trainable={encoder_trainable} probe_trainable={probe_trainable}"
+    )
+    if train_encoder and encoder_trainable == 0:
+        raise RuntimeError(f"{variant}: encoder should be trainable but no encoder parameters require grad")
+    if not train_encoder and encoder_trainable != 0:
+        raise RuntimeError(f"{variant}: encoder should be frozen but some encoder parameters require grad")
+    frozen_before = None
+    if not train_encoder:
+        frozen_before = [
+            p.detach().cpu().clone()
+            for p in encoder_params
+        ]
     trainer = L.Trainer(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
         callbacks=[
             EarlyStopping(monitor="val/mse", patience=cfg.trainer.patience, mode="min"),
-            ModelCheckpoint(monitor="val/mse", mode="min", save_top_k=1, filename="forecast-probe-best"),
+            ModelCheckpoint(monitor="val/mse", mode="min", save_top_k=1, filename=f"forecast-{variant}-best"),
         ],
     )
     trainer.fit(model, dm)
+    if frozen_before is not None:
+        for before, param in zip(frozen_before, encoder_params):
+            if not torch.equal(before, param.detach().cpu()):
+                raise RuntimeError(f"{variant}: frozen encoder/tokenizer parameters changed during training")
     test_results = trainer.test(model, dataloaders=dm.test_dataloader(), ckpt_path="best")
 
     # 이후 bench는 best checkpoint 기준으로 수행
     if trainer.checkpoint_callback.best_model_path:
         model = ForecastProbe.load_from_checkpoint(
             trainer.checkpoint_callback.best_model_path,
-            jepa=jepa,
+            tokenizer=tokenizer,
+            encoder=encoder,
             map_location=device,
         )
     model.to(device)
@@ -154,6 +232,7 @@ def do_bench(
     device: str,
     test_results: list[dict[str, float]],
     cfg: DictConfig,
+    variant: str,
     task,
     report_dir: Path,
 ) -> dict[str, float]:
@@ -196,10 +275,9 @@ def do_bench(
             if row == 0 and col == 0:
                 ax.legend()
     fig.tight_layout()
+    fig.savefig(report_dir / "one_step_examples.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast", "one_step_examples", fig, 0)
-    else:
-        fig.savefig(report_dir / "one_step_examples.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(f"Forecast/{variant}/one_step_examples", "figure", fig, 0)
     plt.close(fig)
 
     # Autoregressive rollout 평가
@@ -332,7 +410,7 @@ def do_bench(
         logger = task.get_logger()
         for key, value in metrics.items():
             title, series = key.split("/", 1)
-            logger.report_scalar(title, series, value=value, iteration=0)
+            logger.report_scalar(f"{variant}/{title}", series, value=value, iteration=0)
     (report_dir / "rollout_metrics.json").write_text(json.dumps(metrics, indent=2))
     (report_dir / "rollout_step_mse_stats.json").write_text(json.dumps(rollout_stats, indent=2))
 
@@ -355,10 +433,9 @@ def do_bench(
         if col == 0:
             ax.legend()
     fig.tight_layout()
+    fig.savefig(report_dir / "rollout_example.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast", "rollout_example", fig, 0)
-    else:
-        fig.savefig(report_dir / "rollout_example.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(f"Forecast/{variant}/rollout_example", "figure", fig, 0)
     plt.close(fig)
 
     # Cumulative MSE 그림 저장
@@ -382,10 +459,9 @@ def do_bench(
     ax.grid(True, alpha=0.25)
     ax.legend()
     fig.tight_layout()
+    fig.savefig(report_dir / "cumulative_mse.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast", "cumulative_mse", fig, 0)
-    else:
-        fig.savefig(report_dir / "cumulative_mse.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(f"Forecast/{variant}/cumulative_mse", "figure", fig, 0)
     plt.close(fig)
 
     # Step MSE 평균과 표준편차 band 그림 저장
@@ -413,10 +489,9 @@ def do_bench(
     count_ax.set_ylabel("# Samples")
     count_ax.legend(loc="upper right")
     fig.tight_layout()
+    fig.savefig(report_dir / "step_mse_band.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast", "step_mse_band", fig, 0)
-    else:
-        fig.savefig(report_dir / "step_mse_band.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(f"Forecast/{variant}/step_mse_band", "figure", fig, 0)
     plt.close(fig)
 
     # 채널별 Step MSE band 그림 저장
@@ -444,10 +519,9 @@ def do_bench(
     axes[-1, 0].set_xlabel("# Steps")
     fig.suptitle("Rollout Step MSE by Channel", y=0.995)
     fig.tight_layout()
+    fig.savefig(report_dir / "channel_step_mse_bands.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast", "channel_step_mse_bands", fig, 0)
-    else:
-        fig.savefig(report_dir / "channel_step_mse_bands.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(f"Forecast/{variant}/channel_step_mse_bands", "figure", fig, 0)
     plt.close(fig)
 
     # Rollout step별 sample count 그림 저장
@@ -461,10 +535,9 @@ def do_bench(
     ax.set_ylabel("# Samples")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
+    fig.savefig(report_dir / "sample_count.png", dpi=150, bbox_inches="tight")
     if task is not None:
-        task.get_logger().report_matplotlib_figure("Forecast", "sample_count", fig, 0)
-    else:
-        fig.savefig(report_dir / "sample_count.png", dpi=150, bbox_inches="tight")
+        task.get_logger().report_matplotlib_figure(f"Forecast/{variant}/sample_count", "figure", fig, 0)
     plt.close(fig)
 
     # 최종 scalar summary 정리 및 저장
@@ -497,7 +570,7 @@ def do_bench(
     if task is not None:
         logger = task.get_logger()
         for key, value in summary.items():
-            logger.report_single_value(key, value)
+            logger.report_single_value(f"{variant}/{key}", value)
     (report_dir / "final_summary.json").write_text(json.dumps(summary, indent=2))
 
     return summary
@@ -524,16 +597,79 @@ def main(cfg: DictConfig) -> None:
         except Exception as e:
             print(f"ClearML 사용 불가: {e}")
 
-    # 모델 학습 후 best checkpoint로 벤치 실행
-    model, trainer, dm, device, test_results = train(cfg)
-    final_summary = do_bench(model, dm, device, test_results, cfg, task, report_dir)
+    # 네 가지 encoder 조건에 대해 같은 downstream 실험 실행
+    variants = [
+        "pretrained_frozen",
+        "random_frozen",
+        "random_supervised",
+        "pretrained_finetune",
+    ]
+    comparison: dict[str, dict[str, float]] = {}
+    best_paths: dict[str, str] = {}
+    for variant in variants:
+        print(f"\n=== forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        warm_start_ckpt = best_paths.get("pretrained_frozen") if variant == "pretrained_finetune" else None
+        model, trainer, dm, device, test_results = train(cfg, variant, warm_start_ckpt=warm_start_ckpt)
+        comparison[variant] = do_bench(model, dm, device, test_results, cfg, variant, task, variant_dir)
+        if trainer.checkpoint_callback.best_model_path:
+            best_paths[variant] = trainer.checkpoint_callback.best_model_path
+
+    # Variant별 scalar 비교 표와 그림 저장
+    key_order = sorted({key for metrics in comparison.values() for key in metrics})
+    comparison_rows = [
+        {"variant": variant, **{key: comparison[variant].get(key, float("nan")) for key in key_order}}
+        for variant in variants
+    ]
+    (report_dir / "comparison_summary.json").write_text(json.dumps(comparison_rows, indent=2))
+    with (report_dir / "comparison_summary.csv").open("w") as f:
+        f.write("variant," + ",".join(key_order) + "\n")
+        for row in comparison_rows:
+            f.write(str(row["variant"]) + "," + ",".join(str(row[key]) for key in key_order) + "\n")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_keys = [
+        key
+        for key in ["one_step/test/mse", "one_step/test/mae", "rollout/mean_mse", "rollout/final_cumulative_mse"]
+        if key in key_order
+    ]
+    if plot_keys:
+        fig, axes = plt.subplots(len(plot_keys), 1, figsize=(9, 3.2 * len(plot_keys)), squeeze=False)
+        x = np.arange(len(variants))
+        for row, key in enumerate(plot_keys):
+            ax = axes[row, 0]
+            values = [comparison[variant].get(key, np.nan) for variant in variants]
+            ax.bar(x, values, color=["tab:blue", "tab:orange", "tab:green", "tab:red"])
+            ax.set_xticks(x, variants, rotation=20, ha="right")
+            ax.set_title(key)
+            ax.grid(True, axis="y", alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(report_dir / "variant_comparison.png", dpi=150, bbox_inches="tight")
+        if task is not None:
+            task.get_logger().report_matplotlib_figure("Forecast", "variant_comparison", fig, 0)
+        plt.close(fig)
+
+    if task is not None:
+        logger = task.get_logger()
+        for variant, metrics in comparison.items():
+            for key, value in metrics.items():
+                logger.report_single_value(f"{variant}/{key}", value)
 
     print(f"forecast reports saved under {report_dir}")
-    print("final summary:")
-    for key, value in final_summary.items():
-        print(f"  {key}: {value:.6f}")
-    if trainer.checkpoint_callback.best_model_path:
-        print(f"best probe checkpoint: {trainer.checkpoint_callback.best_model_path}")
+    print("comparison summary:")
+    for variant in variants:
+        compact = {
+            key: comparison[variant][key]
+            for key in ["one_step/test/mse", "one_step/test/mae", "rollout/mean_mse", "rollout/final_cumulative_mse"]
+            if key in comparison[variant]
+        }
+        print(f"  {variant}: {compact}")
+    for variant, path in best_paths.items():
+        print(f"best probe checkpoint [{variant}]: {path}")
 
 
 if __name__ == "__main__":
