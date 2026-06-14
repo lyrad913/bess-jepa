@@ -1,15 +1,18 @@
 checkpoint: ???
+projection_jepa_checkpoint: ???
+ts_jepa_checkpoint: ???
+mae_checkpoint: ???
 
 data:
   data_dir: data
-  seq_len: 30          # null이면 checkpoint hparams.seq_len 사용
+  seq_len: 320          # null이면 checkpoint hparams.seq_len 사용
   batch_size: 64
   num_workers: 4
   stride: null
   processed_dir_name: processed
   operations: discharge
-  max_horizon: null      # null이면 가능한 모든 미래 cycle pair 사용
-  horizon_stride: 1
+  max_horizon: 100       # null이면 가능한 모든 미래 cycle pair 사용
+  horizon_stride: 5
   dt_scale: 300.0
 
 probe:
@@ -17,14 +20,17 @@ probe:
   weight_decay: 0.0
 
 experiments:
-  pretrained_frozen_attention: true
+  pretrained_frozen_attention: false
   random_frozen: true
-  random_frozen_attention: true
+  random_frozen_attention: false
   random_supervised: true
   pretrained_finetune: true
+  pretrained_projection_jepa_frozen: true
+  pretrained_ts_jepa_frozen: true
+  pretrained_mae_frozen: true
 
 trainer:
-  max_epochs: 300
+  max_epochs: 500
   accelerator: auto
   devices: auto
   patience: 50

@@ -18,18 +18,17 @@ model:
   embed_dim: 128
   enc_nhead: 4
   enc_layers: 2
-  pred_nhead: 4
-  pred_layers: 1
-  sigreg_lambda: 0.1
-  sigreg_knots: 17
-  sigreg_num_proj: 1024
+  decoder_nhead: 4
+  decoder_layers: 2
+  decoder_embed_dim: 128
+  mask_ratio: 0.75
   lr: 3e-4
-  weight_decay: 1e-3
+  weight_decay: 0.05
   warmup_epochs: 10
 
 trainer:
   max_epochs: 1000
   accelerator: auto
   devices: auto
-  patience: 100
+  patience: 30
   seed: 42

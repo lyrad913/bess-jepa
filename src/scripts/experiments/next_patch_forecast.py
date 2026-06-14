@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 
 SRC_DIR = Path(__file__).resolve().parents[2]
@@ -134,6 +135,7 @@ def train(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
+        logger=TensorBoardLogger(save_dir="logs/experiments/next_patch_forecast", name=checkpoint_name),
         callbacks=[
             EarlyStopping(monitor="val/mse", patience=cfg.trainer.patience, mode="min"),
             ModelCheckpoint(monitor="val/mse", mode="min", save_top_k=1, filename=checkpoint_name),

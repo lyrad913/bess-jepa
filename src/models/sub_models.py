@@ -1,8 +1,219 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from einops import rearrange
+
+
+class SinusoidalPE(nn.Module):
+    """Fixed sinusoidal positional encoding with lazy buffer growth."""
+
+    def __init__(self, dim: int, max_len: int = 0, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"sinusoidal PE needs an even dim, got {dim}")
+        self.dim = dim
+        self.base = base
+        self.register_buffer("pe", self._build(max_len), persistent=False)
+
+    def _build(self, length: int, device: torch.device | None = None) -> torch.Tensor:
+        pos = torch.arange(length, dtype=torch.float32, device=device).unsqueeze(1)
+        omega = torch.arange(self.dim // 2, dtype=torch.float32, device=device) / (self.dim / 2.0)
+        omega = 1.0 / (self.base ** omega)
+        out = pos * omega.unsqueeze(0)
+        return torch.cat([out.sin(), out.cos()], dim=-1).unsqueeze(0)
+
+    def _ensure_len(self, length: int, device: torch.device) -> None:
+        if length <= self.pe.shape[1] and self.pe.device == device:
+            return
+        self.pe = self._build(length, device=device)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        x: (B, N, D)
+        positions: optional (N,) or (B, N) original patch indices.
+        """
+        if positions is None:
+            self._ensure_len(x.shape[1], x.device)
+            pe = self.pe[:, : x.shape[1]]
+        else:
+            positions = positions.to(device=x.device, dtype=torch.long)
+            self._ensure_len(int(positions.max().item()) + 1, x.device)
+            if positions.ndim == 1:
+                pe = self.pe[:, positions]
+            elif positions.ndim == 2:
+                pe = self.pe[0, positions]
+            else:
+                raise ValueError(f"positions must have shape (N,) or (B, N), got {tuple(positions.shape)}")
+        return x + pe.to(dtype=x.dtype)
+
+
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """AdaLN-zero modulation."""
+    return x * (1 + scale) + shift
+
+
+class FeedForward(nn.Module):
+    """Feed-forward network used in Transformer blocks."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Attention(nn.Module):
+    """Scaled dot-product self-attention."""
+
+    def __init__(self, dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.heads = heads
+        self.dropout = dropout
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = (rearrange(t, "b n (h d) -> b h n d", h=self.heads) for t in qkv)
+
+        attn_mask = None
+        if src_key_padding_mask is not None:
+            mask = src_key_padding_mask[:, None, None, :].to(device=x.device, dtype=torch.bool)
+            attn_mask = torch.zeros_like(mask, dtype=x.dtype).masked_fill(mask, float("-inf"))
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        out = rearrange(out, "b h n d -> b n (h d)")
+        return self.to_out(out)
+
+
+class Block(nn.Module):
+    """Pre-norm Transformer block."""
+
+    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0, is_causal: bool = False):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.is_causal = is_causal
+
+    def forward(self, x: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), src_key_padding_mask, is_causal=self.is_causal)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class ConditionalBlock(nn.Module):
+    """Pre-norm Transformer block with AdaLN-zero conditioning."""
+
+    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0, is_causal: bool = False):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
+        self.is_causal = is_causal
+
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate_msa * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            src_key_padding_mask,
+            is_causal=self.is_causal,
+        )
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class Transformer(nn.Module):
+    """Transformer stack supporting standard and AdaLN-zero conditional blocks."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        depth: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        block_class: type[nn.Module] = Block,
+        is_causal: bool = False,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.cond_proj = nn.Linear(input_dim, hidden_dim) if input_dim != hidden_dim else nn.Identity()
+        self.layers = nn.ModuleList([
+            block_class(hidden_dim, heads, dim_head, mlp_dim, dropout, is_causal)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim) if hidden_dim != output_dim else nn.Identity()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor | None = None,
+        src_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self.input_proj(x)
+        if c is not None:
+            c = self.cond_proj(c)
+        for block in self.layers:
+            if isinstance(block, ConditionalBlock):
+                if c is None:
+                    raise ValueError("ConditionalBlock requires conditioning tensor c")
+                x = block(x, c, src_key_padding_mask)
+            else:
+                x = block(x, src_key_padding_mask)
+        return self.output_proj(self.norm(x))
+
+
+class GapEmbedder(nn.Module):
+    """Embed scalar window gap into a broadcastable conditioning token."""
+
+    def __init__(self, input_dim: int = 2, emb_dim: int = 128, mlp_scale: int = 4):
+        super().__init__()
+        self.embed = nn.Sequential(
+            nn.Linear(input_dim, mlp_scale * emb_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_scale * emb_dim, emb_dim),
+        )
+
+    def forward(self, gap: torch.Tensor) -> torch.Tensor:
+        gap = gap.float().view(-1, 1)
+        x = torch.cat([gap, torch.log1p(gap)], dim=-1)
+        return self.embed(x)[:, None, :]
 
 
 class Tokenizer(nn.Module):
@@ -54,9 +265,27 @@ class Encoder(nn.Module):
 
     def __init__(self, embed_dim: int, nhead: int, num_layers: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
-        self.transformer = TransformerEncoder(embed_dim, nhead, num_layers, mlp_ratio, dropout, TransformerEncoderBlock)
+        self.pos = SinusoidalPE(embed_dim)
+        self.transformer = Transformer(
+            input_dim=embed_dim,
+            hidden_dim=embed_dim,
+            output_dim=embed_dim,
+            depth=num_layers,
+            heads=nhead,
+            dim_head=embed_dim // nhead,
+            mlp_dim=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            block_class=Block,
+            is_causal=False,
+        )
 
-    def forward(self, x: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self.pos(x, positions=positions)
         return self.transformer(x, src_key_padding_mask=src_key_padding_mask)
 
 
@@ -73,21 +302,34 @@ class Predictor(nn.Module):
 
     def __init__(self, embed_dim: int, nhead: int, num_layers: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
-        # (gap, log1p(gap)) → embed_dim
-        self.gap_embed = nn.Sequential(
-            nn.Linear(2, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
+        self.pos = SinusoidalPE(embed_dim)
+        self.gap_embed = GapEmbedder(input_dim=2, emb_dim=embed_dim)
+        self.transformer = Transformer(
+            input_dim=embed_dim,
+            hidden_dim=embed_dim,
+            output_dim=embed_dim,
+            depth=num_layers,
+            heads=nhead,
+            dim_head=embed_dim // nhead,
+            mlp_dim=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            block_class=ConditionalBlock,
+            is_causal=False,
         )
-        self.transformer = TransformerEncoder(embed_dim, nhead, num_layers, mlp_ratio, dropout, ConditionalTransformerEncoderBlock)
 
-    def forward(self, ctx: torch.Tensor, gap: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        ctx: torch.Tensor,
+        gap: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B = ctx.shape[0]
         if gap is not None:
             gap = gap.to(device=ctx.device, dtype=ctx.dtype).view(B, 1)
-            c = self.gap_embed(torch.cat([gap, torch.log1p(gap)], dim=-1))  # (B, D)
+            c = self.gap_embed(gap).to(device=ctx.device, dtype=ctx.dtype)
         else:
-            c = torch.zeros(B, ctx.shape[-1], device=ctx.device, dtype=ctx.dtype)
+            c = torch.zeros(B, 1, ctx.shape[-1], device=ctx.device, dtype=ctx.dtype)
+        ctx = self.pos(ctx, positions=positions)
         return self.transformer(ctx, c=c)
 
 
@@ -111,15 +353,18 @@ class SIGReg(torch.nn.Module):
 
     def forward(self, proj):
         """
-        proj: (T, B, D)
+        proj: (V, B, D), where V is a view/time axis and B is the sample axis.
         """
         # sample random projections
-        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device, dtype=proj.dtype)
         A = A.div_(A.norm(p=2, dim=0))
         # compute the epps-pulley statistic
-        x_t = (proj @ A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * proj.size(-2)
+        t = self.t.to(dtype=proj.dtype)
+        phi = self.phi.to(dtype=proj.dtype)
+        weights = self.weights.to(dtype=proj.dtype)
+        x_t = (proj @ A).unsqueeze(-1) * t
+        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
 
 class Decoder(nn.Module):

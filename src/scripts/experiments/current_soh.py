@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 
 SRC_DIR = Path(__file__).resolve().parents[2]
@@ -26,9 +27,20 @@ sys.path.insert(0, str(SRC_DIR / "data"))
 
 from current_soh_loader import CurrentSohLoader
 from jepa import JEPA
+from masked_autoencoder import MaskedAutoencoder
+from projection_jepa import ProjectionJEPA
 from sub_models import Encoder, Tokenizer
+from ts_jepa import TSJEPA
 
 SOH_PERCENT_SCALE = 100.0
+
+
+def assert_encoder_compatible(reference_hp, candidate_hp, variant: str) -> None:
+    for key in ["seq_len", "patch_size", "strides", "num_channels", "embed_dim"]:
+        ref = int(getattr(reference_hp, key))
+        cand = int(getattr(candidate_hp, key))
+        if ref != cand:
+            raise ValueError(f"{variant}: checkpoint hparam {key}={cand} does not match JEPA {key}={ref}")
 
 
 class CurrentSohProbe(L.LightningModule):
@@ -169,6 +181,7 @@ def train(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
+        logger=TensorBoardLogger(save_dir="logs/experiments/current_soh", name=checkpoint_name),
         callbacks=[
             EarlyStopping(monitor="val/rmse", patience=cfg.trainer.patience, mode="min"),
             ModelCheckpoint(monitor="val/rmse", mode="min", save_top_k=1, filename=checkpoint_name),
@@ -205,6 +218,7 @@ def do_bench(
 
     # Test set 전체에 대해 prediction, target, cycle index 수집
     preds, targets, cycles = [], [], []
+    model.to(device)
     model.eval()
     with torch.no_grad():
         for batch in dm.test_dataloader():
@@ -582,6 +596,126 @@ def main(cfg: DictConfig) -> None:
             comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
             comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
         best_paths[variant] = pretrained_finetune_ckpt
+
+    # pretrained_projection_jepa_frozen: projection-SIGReg JEPA tokenizer/encoder를 얼리고 SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_projection_jepa_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_projection_jepa_frozen"
+        print(f"\n=== current SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_projection_jepa = ProjectionJEPA.load_from_checkpoint(cfg.projection_jepa_checkpoint, map_location=device)
+        assert_encoder_compatible(hp, pretrained_projection_jepa.hparams, variant)
+        pretrained_projection_jepa_model = CurrentSohProbe(
+            tokenizer=pretrained_projection_jepa.tokenizer,
+            encoder=pretrained_projection_jepa.encoder,
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_projection_jepa_ckpt = train(
+            pretrained_projection_jepa_model,
+            dm,
+            cfg,
+            "current-soh-pretrained_projection_jepa_frozen-best",
+            frozen_modules=[pretrained_projection_jepa_model.tokenizer, pretrained_projection_jepa_model.encoder],
+        )
+        pretrained_projection_jepa_best = CurrentSohProbe.load_from_checkpoint(
+            pretrained_projection_jepa_ckpt,
+            tokenizer=pretrained_projection_jepa_model.tokenizer,
+            encoder=pretrained_projection_jepa_model.encoder,
+            map_location=device,
+        )
+        pretrained_projection_jepa_best.to(device)
+        test_results = trainer.test(pretrained_projection_jepa_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_projection_jepa_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = pretrained_projection_jepa_ckpt
+
+    # pretrained_ts_jepa_frozen: pretrained TS-JEPA tokenizer/encoder를 얼리고 SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_ts_jepa_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_ts_jepa_frozen"
+        print(f"\n=== current SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_ts_jepa = TSJEPA.load_from_checkpoint(cfg.ts_jepa_checkpoint, map_location=device)
+        assert_encoder_compatible(hp, pretrained_ts_jepa.hparams, variant)
+        pretrained_ts_jepa_model = CurrentSohProbe(
+            tokenizer=pretrained_ts_jepa.tokenizer,
+            encoder=pretrained_ts_jepa.encoder,
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_ts_jepa_ckpt = train(
+            pretrained_ts_jepa_model,
+            dm,
+            cfg,
+            "current-soh-pretrained_ts_jepa_frozen-best",
+            frozen_modules=[pretrained_ts_jepa_model.tokenizer, pretrained_ts_jepa_model.encoder],
+        )
+        pretrained_ts_jepa_best = CurrentSohProbe.load_from_checkpoint(
+            pretrained_ts_jepa_ckpt,
+            tokenizer=pretrained_ts_jepa_model.tokenizer,
+            encoder=pretrained_ts_jepa_model.encoder,
+            map_location=device,
+        )
+        pretrained_ts_jepa_best.to(device)
+        test_results = trainer.test(pretrained_ts_jepa_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_ts_jepa_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = pretrained_ts_jepa_ckpt
+
+    # pretrained_mae_frozen: pretrained MAE tokenizer/encoder를 얼리고 SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_mae_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_mae_frozen"
+        print(f"\n=== current SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_mae = MaskedAutoencoder.load_from_checkpoint(cfg.mae_checkpoint, map_location=device)
+        assert_encoder_compatible(hp, pretrained_mae.hparams, variant)
+        pretrained_mae_model = CurrentSohProbe(
+            tokenizer=pretrained_mae.tokenizer,
+            encoder=pretrained_mae.encoder,
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_mae_ckpt = train(
+            pretrained_mae_model,
+            dm,
+            cfg,
+            "current-soh-pretrained_mae_frozen-best",
+            frozen_modules=[pretrained_mae_model.tokenizer, pretrained_mae_model.encoder],
+        )
+        pretrained_mae_best = CurrentSohProbe.load_from_checkpoint(
+            pretrained_mae_ckpt,
+            tokenizer=pretrained_mae_model.tokenizer,
+            encoder=pretrained_mae_model.encoder,
+            map_location=device,
+        )
+        pretrained_mae_best.to(device)
+        test_results = trainer.test(pretrained_mae_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_mae_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = pretrained_mae_ckpt
 
     # Variant별 scalar 비교 표와 그림 저장
     variants = list(comparison)

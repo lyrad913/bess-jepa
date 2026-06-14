@@ -1,4 +1,3 @@
-from einops import rearrange
 import torch
 import torch.nn.functional as F
 import lightning as L
@@ -21,7 +20,7 @@ class JEPA(L.LightningModule):
         ctx_emb    = Encoder(ctx_tokens)              # (B, N, D)
         tgt_emb    = Encoder(tgt_tokens)              # (B, N, D)
         pred       = Predictor(ctx_emb, gap)          # (B, N, D)
-        loss       = MSE(pred, tgt_emb) + SIGReg(ctx_emb) + SIGReg(tgt_emb)
+        loss       = SmoothL1(pred, tgt_emb) + SIGReg(ctx_emb, tgt_emb)
     """
 
     def __init__(
@@ -57,7 +56,10 @@ class JEPA(L.LightningModule):
 
         self._val_z: list[torch.Tensor] = []
 
-    def module_step(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def module_step(
+        self,
+        batch: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if isinstance(batch, dict):
             x = batch["x"]                           # (B, C, T)
             y = batch["y"]                           # (B, C, T)
@@ -74,12 +76,11 @@ class JEPA(L.LightningModule):
 
         # Loss
         pred_loss = F.smooth_l1_loss(pred_emb, tgt_emb)
-        ce = rearrange(ctx_emb, 'b n d -> n b d')
-        te = rearrange(tgt_emb, 'b n d -> n b d')
-        sigreg_loss = 0.5 * self.sigreg(ce) + 0.5 * self.sigreg(te)
+        proj = torch.cat([ctx_emb, tgt_emb], dim=1).transpose(0, 1)
+        sigreg_loss = self.sigreg(proj)
         loss = pred_loss + self.sigreg_lambda * sigreg_loss
 
-        return loss, pred_loss, sigreg_loss, torch.cat([ctx_emb, tgt_emb])
+        return loss, pred_loss, sigreg_loss, torch.cat([ctx_emb, tgt_emb], dim=1)
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         loss, pred_loss, sigreg_loss, _ = self.module_step(batch)
@@ -89,26 +90,33 @@ class JEPA(L.LightningModule):
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         loss, pred_loss, sigreg_loss, z = self.module_step(batch)
         self.log_dict({"val/loss": loss, "val/pred_loss": pred_loss, "val/sigreg_loss": sigreg_loss})
-        self._log_collapse_metrics(z.mean(dim=1))
-        self._val_z.append(z.mean(dim=1).detach().cpu())
+        self._log_collapse_metrics(z.mean(dim=1), prefix="emb")
+        self._log_collapse_metrics(z.flatten(0, 1), prefix="emb_patch")
+        self._val_z.append(z.detach().cpu())
 
     def on_validation_epoch_end(self) -> None:
         z = torch.cat(self._val_z, dim=0)
         self._val_z.clear()
-        self._log_epoch_diagnostics(z)
+        self._log_epoch_diagnostics(
+            z.mean(dim=1), title="Sequence", series_suffix="", section="Embeddings", metric_prefix="emb"
+        )
+        self._log_epoch_diagnostics(
+            z.flatten(0, 1), title="Patch", series_suffix=" Patch", section="Embeddings", metric_prefix="emb_patch"
+        )
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
         loss, pred_loss, sigreg_loss, _ = self.module_step(batch)
         self.log_dict({"test/loss": loss, "test/pred_loss": pred_loss, "test/sigreg_loss": sigreg_loss})
 
-    def _log_collapse_metrics(self, z: torch.Tensor) -> None:
-        """z: (B, D) – view embeddings averaged over patches."""
+    def _log_collapse_metrics(self, z: torch.Tensor, prefix: str) -> None:
+        """z: (samples, D)."""
         # std per dim across the batch → mean; approaches 0 on collapse
         emb_std = z.std(dim=0).mean()
 
         # mean pairwise cosine similarity; approaches 1 on collapse
-        z_norm = F.normalize(z, dim=-1)
-        B = z.shape[0]
+        z_cos = z[:512]
+        z_norm = F.normalize(z_cos, dim=-1)
+        B = z_cos.shape[0]
         if B > 1:
             cos_mat = z_norm @ z_norm.T                      # (B, B)
             n_pairs = B * (B - 1) / 2
@@ -116,9 +124,16 @@ class JEPA(L.LightningModule):
         else:
             cos_sim = z.new_zeros(())
 
-        self.log_dict({"emb/std": emb_std, "emb/cos_sim": cos_sim})
+        self.log_dict({f"{prefix}/std": emb_std, f"{prefix}/cos_sim": cos_sim})
 
-    def _log_epoch_diagnostics(self, z: torch.Tensor) -> None:
+    def _log_epoch_diagnostics(
+        self,
+        z: torch.Tensor,
+        title: str,
+        series_suffix: str,
+        section: str,
+        metric_prefix: str,
+    ) -> None:
         """Epoch-level plots: PCA scatter + per-dim std. Logged via ClearML."""
         import matplotlib
         matplotlib.use("Agg")
@@ -131,7 +146,7 @@ class JEPA(L.LightningModule):
         _, s, Vt = torch.linalg.svd(z_c, full_matrices=False)
         p = s / (s.sum() + 1e-8)
         eff_rank = torch.exp(-(p * (p + 1e-8).log()).sum()).item()
-        self.log("emb/effective_rank", eff_rank)
+        self.log(f"{metric_prefix}/effective_rank", eff_rank)
 
         try:
             from clearml import Logger as ClearMLLogger
@@ -148,8 +163,8 @@ class JEPA(L.LightningModule):
         ax.scatter(coords[:, 0], coords[:, 1], s=2, alpha=0.3)
         ax.set_xlabel(f"PC1 ({var_ratio[0]:.1%})")
         ax.set_ylabel(f"PC2 ({var_ratio[1]:.1%})")
-        ax.set_title(f"View embedding PCA  epoch={step}  eff_rank={eff_rank:.1f}")
-        cl_logger.report_matplotlib_figure("Embeddings", "PCA", fig, step)
+        ax.set_title(f"{title} embedding PCA  epoch={step}  eff_rank={eff_rank:.1f}")
+        cl_logger.report_matplotlib_figure(section, f"PCA{series_suffix}", fig, step)
         plt.close(fig)
 
         # 2. Per-dim std sorted descending – dead dims show up as near-zero tail
@@ -160,9 +175,9 @@ class JEPA(L.LightningModule):
         dead = int((dim_std < 0.1).sum())
         ax.set_xlabel("Embedding dimension (sorted by std)")
         ax.set_ylabel("Std across samples")
-        ax.set_title(f"Per-dim std  epoch={step}  dead_dims={dead}/{len(dim_std)}")
+        ax.set_title(f"{title} per-dim std  epoch={step}  dead_dims={dead}/{len(dim_std)}")
         ax.legend()
-        cl_logger.report_matplotlib_figure("Embeddings", "Dim Std", fig, step)
+        cl_logger.report_matplotlib_figure(section, f"Dim Std{series_suffix}", fig, step)
         plt.close(fig)
 
     def configure_optimizers(self):

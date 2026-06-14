@@ -9,6 +9,9 @@ wheels/
 outputs/
 lightning_logs/
 *_reports/
+src/scripts/run_overnight.sh
+.gitignore
+logs/
 
 # Virtual environments
 .venv

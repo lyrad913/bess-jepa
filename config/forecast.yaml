@@ -1,4 +1,7 @@
 checkpoint: ???
+projection_jepa_checkpoint: ???
+ts_jepa_checkpoint: ???
+mae_checkpoint: ???
 
 data:
   data_dir: data
@@ -18,12 +21,15 @@ experiments:
   random_frozen: true
   random_supervised: true
   pretrained_finetune: true
+  pretrained_projection_jepa_frozen: true
+  pretrained_ts_jepa_frozen: true
+  pretrained_mae_frozen: true
 
 trainer:
-  max_epochs: 100
+  max_epochs: 500
   accelerator: auto
   devices: auto
-  patience: 15
+  patience: 50
   seed: 42
 
 report:
