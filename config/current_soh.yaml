@@ -13,8 +13,15 @@ probe:
   lr: 1e-3
   weight_decay: 0.0
 
+experiments:
+  pretrained_frozen_attention: true
+  random_frozen: true
+  random_frozen_attention: true
+  random_supervised: true
+  pretrained_finetune: true
+
 trainer:
-  max_epochs: 100
+  max_epochs: 500
   accelerator: auto
   devices: auto
   patience: 50

@@ -42,6 +42,7 @@ class CurrentSohProbe(L.LightningModule):
         train_encoder: bool,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
+        pooling: str = "mean",
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["tokenizer", "encoder"])
@@ -49,12 +50,23 @@ class CurrentSohProbe(L.LightningModule):
         self.tokenizer = tokenizer
         self.encoder = encoder
         self.train_encoder = train_encoder
+        self.pooling = str(pooling)
+        if self.pooling not in {"mean", "attention"}:
+            raise ValueError(f"unknown pooling={self.pooling}; expected 'mean' or 'attention'")
         for p in self.tokenizer.parameters():
             p.requires_grad = train_encoder
         for p in self.encoder.parameters():
             p.requires_grad = train_encoder
 
-        self.head = nn.Linear(int(embed_dim), 1)
+        embed_dim = int(embed_dim)
+        if self.pooling == "attention":
+            self.patch_pool = nn.Linear(embed_dim, 1)
+            self.segment_pool = nn.Linear(embed_dim, 1)
+        self.head = nn.Linear(embed_dim, 1)
+
+    def pool_embeddings(self, x: torch.Tensor, pooler: nn.Linear) -> torch.Tensor:
+        weights = torch.softmax(pooler(x).squeeze(-1), dim=0)
+        return torch.sum(x * weights.unsqueeze(-1), dim=0)
 
     def encode_segment(self, segment: torch.Tensor) -> torch.Tensor:
         if segment.ndim != 2:
@@ -68,7 +80,10 @@ class CurrentSohProbe(L.LightningModule):
             with torch.no_grad():
                 tokens = self.tokenizer(segment.to(self.device).unsqueeze(0))
                 z = self.encoder(tokens)
-        return z.mean(dim=1).squeeze(0)
+        z = z.squeeze(0)
+        if self.pooling == "attention":
+            return self.pool_embeddings(z, self.patch_pool)
+        return z.mean(dim=0)
 
     def forward(self, segments: list[list[torch.Tensor]]) -> torch.Tensor:
         cycle_embeddings = []
@@ -77,7 +92,11 @@ class CurrentSohProbe(L.LightningModule):
                 self.encode_segment(segment)
                 for segment in cycle_segments
             ]
-            cycle_embeddings.append(torch.stack(segment_embeddings, dim=0).mean(dim=0))
+            segment_embeddings = torch.stack(segment_embeddings, dim=0)
+            if self.pooling == "attention":
+                cycle_embeddings.append(self.pool_embeddings(segment_embeddings, self.segment_pool))
+            else:
+                cycle_embeddings.append(segment_embeddings.mean(dim=0))
 
         cycle_emb = torch.stack(cycle_embeddings, dim=0)
         return self.head(cycle_emb).squeeze(-1)
@@ -111,6 +130,8 @@ class CurrentSohProbe(L.LightningModule):
 
     def configure_optimizers(self):
         params = list(self.head.parameters())
+        if self.pooling == "attention":
+            params = list(self.patch_pool.parameters()) + list(self.segment_pool.parameters()) + params
         if self.train_encoder:
             params = list(self.tokenizer.parameters()) + list(self.encoder.parameters()) + params
         return torch.optim.AdamW(
@@ -121,112 +142,53 @@ class CurrentSohProbe(L.LightningModule):
 
 
 def train(
+    model: CurrentSohProbe,
+    dm: CurrentSohLoader,
     cfg: DictConfig,
-    variant: str,
-    warm_start_ckpt: str | None = None,
-) -> tuple[CurrentSohProbe, L.Trainer, CurrentSohLoader, str]:
-    # Variant별 tokenizer/encoder와 Current-SoH datamodule 준비
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
-    jepa.eval()
-    hp = jepa.hparams
-
-    seq_len = cfg.data.seq_len or int(hp.seq_len)
-    if seq_len != int(hp.seq_len):
-        raise ValueError(
-            f"Current SoH seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}"
-        )
-
-    dm = CurrentSohLoader(
-        data_dir=cfg.data.data_dir,
-        seq_len=seq_len,
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        stride=cfg.data.stride,
-        processed_dir_name=cfg.data.processed_dir_name,
-        operations=cfg.data.operations,
-        min_segment_len=int(hp.patch_size),
-    )
-    dm.setup()
-
-    pretrained = variant.startswith("pretrained")
-    train_encoder = variant in {"random_supervised", "pretrained_finetune"}
-    if pretrained:
-        tokenizer = jepa.tokenizer
-        encoder = jepa.encoder
-    else:
-        tokenizer = Tokenizer(
-            seq_len=int(hp.seq_len),
-            patch_len=int(hp.patch_size),
-            strides=int(hp.strides),
-            n_features=int(hp.num_channels),
-            embed_dim=int(hp.embed_dim),
-        )
-        encoder = Encoder(
-            embed_dim=int(hp.embed_dim),
-            nhead=int(hp.enc_nhead),
-            num_layers=int(hp.enc_layers),
-        )
-
-    # Variant 조건에 따라 encoder를 freeze하거나 supervised로 같이 학습
-    lr = 1e-4 if variant == "pretrained_finetune" else cfg.probe.lr
-    model = CurrentSohProbe(
-        tokenizer=tokenizer,
-        encoder=encoder,
-        embed_dim=int(hp.embed_dim),
-        train_encoder=train_encoder,
-        lr=lr,
-        weight_decay=cfg.probe.weight_decay,
-    )
-    if variant == "pretrained_finetune":
-        if warm_start_ckpt is None:
-            raise RuntimeError("pretrained_finetune requires pretrained_frozen best checkpoint")
-        checkpoint = torch.load(warm_start_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["state_dict"], strict=True)
-        print(f"[{variant}] warm-start from pretrained_frozen checkpoint: {warm_start_ckpt}")
+    checkpoint_name: str,
+    frozen_modules: list[torch.nn.Module] | None = None,
+) -> tuple[L.Trainer, str]:
+    # 이미 main에서 명시적으로 만든 model과 datamodule을 받아 학습만 수행
+    frozen_params = []
+    for module in frozen_modules or []:
+        frozen_params.extend(list(module.parameters()))
     encoder_params = list(model.tokenizer.parameters()) + list(model.encoder.parameters())
     encoder_trainable = sum(p.numel() for p in encoder_params if p.requires_grad)
-    probe_trainable = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
+    probe_params = list(model.head.parameters())
+    if model.pooling == "attention":
+        probe_params = list(model.patch_pool.parameters()) + list(model.segment_pool.parameters()) + probe_params
+    probe_trainable = sum(p.numel() for p in probe_params if p.requires_grad)
     print(
-        f"[{variant}] lr={lr} train_encoder={train_encoder} "
+        f"[{checkpoint_name}] lr={model.hparams.lr} train_encoder={model.train_encoder} "
         f"encoder_trainable={encoder_trainable} probe_trainable={probe_trainable}"
     )
-    if train_encoder and encoder_trainable == 0:
-        raise RuntimeError(f"{variant}: encoder should be trainable but no encoder parameters require grad")
-    if not train_encoder and encoder_trainable != 0:
-        raise RuntimeError(f"{variant}: encoder should be frozen but some encoder parameters require grad")
-    frozen_before = None
-    if not train_encoder:
-        frozen_before = [
-            p.detach().cpu().clone()
-            for p in encoder_params
-        ]
+    if frozen_params and any(p.requires_grad for p in frozen_params):
+        raise RuntimeError(f"{checkpoint_name}: frozen parameters still require grad")
+    frozen_before = [p.detach().cpu().clone() for p in frozen_params]
     trainer = L.Trainer(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
         callbacks=[
             EarlyStopping(monitor="val/rmse", patience=cfg.trainer.patience, mode="min"),
-            ModelCheckpoint(monitor="val/rmse", mode="min", save_top_k=1, filename=f"current-soh-{variant}-best"),
+            ModelCheckpoint(monitor="val/rmse", mode="min", save_top_k=1, filename=checkpoint_name),
         ],
     )
     trainer.fit(model, dm)
-    if frozen_before is not None:
-        for before, param in zip(frozen_before, encoder_params):
-            if not torch.equal(before, param.detach().cpu()):
-                raise RuntimeError(f"{variant}: frozen encoder/tokenizer parameters changed during training")
-    trainer.test(model, dataloaders=dm.test_dataloader(), ckpt_path="best")
-
-    # 이후 bench는 best checkpoint 기준으로 수행
-    if trainer.checkpoint_callback.best_model_path:
-        model = CurrentSohProbe.load_from_checkpoint(
-            trainer.checkpoint_callback.best_model_path,
-            tokenizer=tokenizer,
-            encoder=encoder,
-            map_location=device,
-        )
-    model.to(device)
-    return model, trainer, dm, device
+    for before, param in zip(frozen_before, frozen_params):
+        if not torch.equal(before, param.detach().cpu()):
+            raise RuntimeError(f"{checkpoint_name}: frozen parameters changed during training")
+    best_path = trainer.checkpoint_callback.best_model_path
+    if not best_path:
+        raise RuntimeError(f"{checkpoint_name}: best checkpoint was not saved")
+    best_score = trainer.checkpoint_callback.best_model_score
+    best_score_value = float(best_score.detach().cpu()) if best_score is not None else float("nan")
+    print(
+        f"[{checkpoint_name}] best_val/rmse={best_score_value:.6g} "
+        f"current_epoch={trainer.current_epoch} max_epochs={cfg.trainer.max_epochs} "
+        f"best_checkpoint={best_path}"
+    )
+    return trainer, best_path
 
 
 def do_bench(
@@ -316,6 +278,7 @@ def do_bench(
 @hydra.main(config_path="../../../config", config_name="current_soh", version_base=None)
 def main(cfg: DictConfig) -> None:
     L.seed_everything(cfg.trainer.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     report_dir = Path(cfg.report.dir)
     report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -329,31 +292,299 @@ def main(cfg: DictConfig) -> None:
                 project_name="BESS-JEPA",
                 task_name="experiment_current_soh",
                 reuse_last_task_id=False,
+                auto_connect_frameworks={"matplotlib": False},
             )
             task.connect(OmegaConf.to_container(cfg, resolve=True))
         except Exception as e:
             print(f"ClearML 사용 불가: {e}")
 
-    # 네 가지 encoder 조건에 대해 같은 downstream 실험 실행
-    variants = [
-        "pretrained_frozen",
-        "random_frozen",
-        "random_supervised",
-        "pretrained_finetune",
-    ]
+    # 공통 checkpoint hparams와 current-SoH datamodule 준비
+    jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+    jepa.eval()
+    hp = jepa.hparams
+    seq_len = cfg.data.seq_len or int(hp.seq_len)
+    if seq_len != int(hp.seq_len):
+        raise ValueError(f"Current SoH seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}")
+    dm = CurrentSohLoader(
+        data_dir=cfg.data.data_dir,
+        seq_len=seq_len,
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        stride=cfg.data.stride,
+        processed_dir_name=cfg.data.processed_dir_name,
+        operations=cfg.data.operations,
+        min_segment_len=int(hp.patch_size),
+    )
+    dm.setup()
+
     comparison: dict[str, dict[str, float]] = {}
     best_paths: dict[str, str] = {}
-    for variant in variants:
+
+    # pretrained_frozen: pretrained tokenizer/encoder를 얼리고 SoH head만 학습
+    L.seed_everything(cfg.trainer.seed)
+    variant = "pretrained_frozen"
+    print(f"\n=== current SoH variant: {variant} ===")
+    variant_dir = report_dir / variant
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    pretrained_frozen_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+    pretrained_frozen_model = CurrentSohProbe(
+        tokenizer=pretrained_frozen_jepa.tokenizer,
+        encoder=pretrained_frozen_jepa.encoder,
+        embed_dim=int(hp.embed_dim),
+        train_encoder=False,
+        lr=cfg.probe.lr,
+        weight_decay=cfg.probe.weight_decay,
+    )
+    trainer, pretrained_frozen_ckpt = train(
+        pretrained_frozen_model,
+        dm,
+        cfg,
+        "current-soh-pretrained_frozen-best",
+        frozen_modules=[pretrained_frozen_model.tokenizer, pretrained_frozen_model.encoder],
+    )
+    pretrained_frozen_best = CurrentSohProbe.load_from_checkpoint(
+        pretrained_frozen_ckpt,
+        tokenizer=pretrained_frozen_model.tokenizer,
+        encoder=pretrained_frozen_model.encoder,
+        map_location=device,
+    )
+    pretrained_frozen_best.to(device)
+    test_results = trainer.test(pretrained_frozen_best, dataloaders=dm.test_dataloader())
+    comparison[variant] = do_bench(pretrained_frozen_best, dm, device, variant, task, variant_dir)
+    comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+    comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+    if test_results:
+        comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+        comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+    best_paths[variant] = pretrained_frozen_ckpt
+
+    # pretrained_frozen_attention: pretrained tokenizer/encoder는 얼리고 attention pooling SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_frozen_attention", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_frozen_attention"
         print(f"\n=== current SoH variant: {variant} ===")
         variant_dir = report_dir / variant
         variant_dir.mkdir(parents=True, exist_ok=True)
-        warm_start_ckpt = best_paths.get("pretrained_frozen") if variant == "pretrained_finetune" else None
-        model, trainer, dm, device = train(cfg, variant, warm_start_ckpt=warm_start_ckpt)
-        comparison[variant] = do_bench(model, dm, device, variant, task, variant_dir)
-        if trainer.checkpoint_callback.best_model_path:
-            best_paths[variant] = trainer.checkpoint_callback.best_model_path
+        pretrained_frozen_attention_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+        pretrained_frozen_attention_model = CurrentSohProbe(
+            tokenizer=pretrained_frozen_attention_jepa.tokenizer,
+            encoder=pretrained_frozen_attention_jepa.encoder,
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+            pooling="attention",
+        )
+        trainer, pretrained_frozen_attention_ckpt = train(
+            pretrained_frozen_attention_model,
+            dm,
+            cfg,
+            "current-soh-pretrained_frozen_attention-best",
+            frozen_modules=[pretrained_frozen_attention_model.tokenizer, pretrained_frozen_attention_model.encoder],
+        )
+        pretrained_frozen_attention_best = CurrentSohProbe.load_from_checkpoint(
+            pretrained_frozen_attention_ckpt,
+            tokenizer=pretrained_frozen_attention_model.tokenizer,
+            encoder=pretrained_frozen_attention_model.encoder,
+            map_location=device,
+        )
+        pretrained_frozen_attention_best.to(device)
+        test_results = trainer.test(pretrained_frozen_attention_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_frozen_attention_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = pretrained_frozen_attention_ckpt
+
+    # random_frozen: random tokenizer/encoder를 얼리고 SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.random_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "random_frozen"
+        print(f"\n=== current SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        random_frozen_model = CurrentSohProbe(
+            tokenizer=Tokenizer(
+                seq_len=int(hp.seq_len),
+                patch_len=int(hp.patch_size),
+                strides=int(hp.strides),
+                n_features=int(hp.num_channels),
+                embed_dim=int(hp.embed_dim),
+            ),
+            encoder=Encoder(
+                embed_dim=int(hp.embed_dim),
+                nhead=int(hp.enc_nhead),
+                num_layers=int(hp.enc_layers),
+            ),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, random_frozen_ckpt = train(
+            random_frozen_model,
+            dm,
+            cfg,
+            "current-soh-random_frozen-best",
+            frozen_modules=[random_frozen_model.tokenizer, random_frozen_model.encoder],
+        )
+        random_frozen_best = CurrentSohProbe.load_from_checkpoint(
+            random_frozen_ckpt,
+            tokenizer=random_frozen_model.tokenizer,
+            encoder=random_frozen_model.encoder,
+            map_location=device,
+        )
+        random_frozen_best.to(device)
+        test_results = trainer.test(random_frozen_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(random_frozen_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = random_frozen_ckpt
+
+    # random_frozen_attention: random tokenizer/encoder는 얼리고 attention pooling SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.random_frozen_attention", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "random_frozen_attention"
+        print(f"\n=== current SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        random_frozen_attention_model = CurrentSohProbe(
+            tokenizer=Tokenizer(
+                seq_len=int(hp.seq_len),
+                patch_len=int(hp.patch_size),
+                strides=int(hp.strides),
+                n_features=int(hp.num_channels),
+                embed_dim=int(hp.embed_dim),
+            ),
+            encoder=Encoder(
+                embed_dim=int(hp.embed_dim),
+                nhead=int(hp.enc_nhead),
+                num_layers=int(hp.enc_layers),
+            ),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+            pooling="attention",
+        )
+        trainer, random_frozen_attention_ckpt = train(
+            random_frozen_attention_model,
+            dm,
+            cfg,
+            "current-soh-random_frozen_attention-best",
+            frozen_modules=[random_frozen_attention_model.tokenizer, random_frozen_attention_model.encoder],
+        )
+        random_frozen_attention_best = CurrentSohProbe.load_from_checkpoint(
+            random_frozen_attention_ckpt,
+            tokenizer=random_frozen_attention_model.tokenizer,
+            encoder=random_frozen_attention_model.encoder,
+            map_location=device,
+        )
+        random_frozen_attention_best.to(device)
+        test_results = trainer.test(random_frozen_attention_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(random_frozen_attention_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = random_frozen_attention_ckpt
+
+    # random_supervised: random tokenizer/encoder와 SoH head를 모두 supervised로 학습
+    if OmegaConf.select(cfg, "experiments.random_supervised", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "random_supervised"
+        print(f"\n=== current SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        random_supervised_model = CurrentSohProbe(
+            tokenizer=Tokenizer(
+                seq_len=int(hp.seq_len),
+                patch_len=int(hp.patch_size),
+                strides=int(hp.strides),
+                n_features=int(hp.num_channels),
+                embed_dim=int(hp.embed_dim),
+            ),
+            encoder=Encoder(
+                embed_dim=int(hp.embed_dim),
+                nhead=int(hp.enc_nhead),
+                num_layers=int(hp.enc_layers),
+            ),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=True,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, random_supervised_ckpt = train(
+            random_supervised_model,
+            dm,
+            cfg,
+            "current-soh-random_supervised-best",
+        )
+        random_supervised_best = CurrentSohProbe.load_from_checkpoint(
+            random_supervised_ckpt,
+            tokenizer=random_supervised_model.tokenizer,
+            encoder=random_supervised_model.encoder,
+            map_location=device,
+        )
+        random_supervised_best.to(device)
+        test_results = trainer.test(random_supervised_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(random_supervised_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = random_supervised_ckpt
+
+    # pretrained_finetune: pretrained_frozen의 학습된 SoH head까지 불러온 뒤 1e-4로 전체 finetuning
+    if OmegaConf.select(cfg, "experiments.pretrained_finetune", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_finetune"
+        print(f"\n=== current SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_finetune_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+        pretrained_finetune_model = CurrentSohProbe(
+            tokenizer=pretrained_finetune_jepa.tokenizer,
+            encoder=pretrained_finetune_jepa.encoder,
+            embed_dim=int(hp.embed_dim),
+            train_encoder=True,
+            lr=1e-4,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        checkpoint = torch.load(pretrained_frozen_ckpt, map_location=device, weights_only=False)
+        pretrained_finetune_model.load_state_dict(checkpoint["state_dict"], strict=True)
+        print(f"[{variant}] warm-start from pretrained_frozen checkpoint: {pretrained_frozen_ckpt}")
+        trainer, pretrained_finetune_ckpt = train(
+            pretrained_finetune_model,
+            dm,
+            cfg,
+            "current-soh-pretrained_finetune-best",
+        )
+        pretrained_finetune_best = CurrentSohProbe.load_from_checkpoint(
+            pretrained_finetune_ckpt,
+            tokenizer=pretrained_finetune_model.tokenizer,
+            encoder=pretrained_finetune_model.encoder,
+            map_location=device,
+        )
+        pretrained_finetune_best.to(device)
+        test_results = trainer.test(pretrained_finetune_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_finetune_best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = pretrained_finetune_ckpt
 
     # Variant별 scalar 비교 표와 그림 저장
+    variants = list(comparison)
     key_order = sorted({key for metrics in comparison.values() for key in metrics})
     comparison_rows = [
         {"variant": variant, **{key: comparison[variant].get(key, float("nan")) for key in key_order}}
@@ -373,10 +604,11 @@ def main(cfg: DictConfig) -> None:
     if plot_keys:
         fig, axes = plt.subplots(len(plot_keys), 1, figsize=(9, 3.2 * len(plot_keys)), squeeze=False)
         x = np.arange(len(variants))
+        colors = plt.get_cmap("tab10")(np.linspace(0, 1, len(variants)))
         for row, key in enumerate(plot_keys):
             ax = axes[row, 0]
             values = [comparison[variant].get(key, np.nan) for variant in variants]
-            ax.bar(x, values, color=["tab:blue", "tab:orange", "tab:green", "tab:red"])
+            ax.bar(x, values, color=colors)
             ax.set_xticks(x, variants, rotation=20, ha="right")
             ax.set_title(key)
             ax.grid(True, axis="y", alpha=0.25)

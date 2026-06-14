@@ -110,118 +110,43 @@ class NextPatchForecastProbe(L.LightningModule):
 
 
 def train(
+    model: NextPatchForecastProbe,
+    dm: ForecastLoader,
     cfg: DictConfig,
-    variant: str,
-    warm_start_ckpt: str | None = None,
-) -> tuple[NextPatchForecastProbe, L.Trainer, ForecastLoader, str, int | None, list[dict[str, float]]]:
-    # Variant별 tokenizer/encoder와 next-patch forecasting datamodule 준비
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
-    jepa.eval()
-    hp = jepa.hparams
-
-    seq_len = cfg.data.seq_len or int(hp.seq_len)
-    if seq_len != int(hp.seq_len):
-        raise ValueError(
-            f"Next-patch forecast seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}"
-        )
-
-    patch_size = int(hp.patch_size)
-    configured_rollout_steps = cfg.data.rollout_steps
-    configured_rollout_steps = None if configured_rollout_steps is None else int(configured_rollout_steps)
-    dm = ForecastLoader(
-        data_dir=cfg.data.data_dir,
-        datasets=cfg.data.datasets,
-        seq_len=seq_len,
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        stride=cfg.data.stride,
-        rollout_steps=configured_rollout_steps,
-        rollout_step_size=patch_size,
-        processed_dir_name=cfg.data.processed_dir_name,
-    )
-    dm.setup()
-
-    pretrained = variant.startswith("pretrained")
-    train_encoder = variant in {"random_supervised", "pretrained_finetune"}
-    if pretrained:
-        tokenizer = jepa.tokenizer
-        encoder = jepa.encoder
-    else:
-        tokenizer = Tokenizer(
-            seq_len=int(hp.seq_len),
-            patch_len=int(hp.patch_size),
-            strides=int(hp.strides),
-            n_features=int(hp.num_channels),
-            embed_dim=int(hp.embed_dim),
-        )
-        encoder = Encoder(
-            embed_dim=int(hp.embed_dim),
-            nhead=int(hp.enc_nhead),
-            num_layers=int(hp.enc_layers),
-        )
-
-    # Variant 조건에 따라 encoder를 freeze하거나 supervised로 같이 학습
-    lr = 1e-4 if variant == "pretrained_finetune" else cfg.probe.lr
-    model = NextPatchForecastProbe(
-        tokenizer=tokenizer,
-        encoder=encoder,
-        patch_size=int(hp.patch_size),
-        num_channels=int(hp.num_channels),
-        embed_dim=int(hp.embed_dim),
-        train_encoder=train_encoder,
-        lr=lr,
-        weight_decay=cfg.probe.weight_decay,
-    )
-    if variant == "pretrained_finetune":
-        if warm_start_ckpt is None:
-            raise RuntimeError("pretrained_finetune requires pretrained_frozen best checkpoint")
-        checkpoint = torch.load(warm_start_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["state_dict"], strict=True)
-        print(f"[{variant}] warm-start from pretrained_frozen checkpoint: {warm_start_ckpt}")
+    checkpoint_name: str,
+    frozen_modules: list[torch.nn.Module] | None = None,
+) -> tuple[L.Trainer, str]:
+    # 이미 main에서 명시적으로 만든 model과 datamodule을 받아 학습만 수행
+    frozen_params = []
+    for module in frozen_modules or []:
+        frozen_params.extend(list(module.parameters()))
     encoder_params = list(model.tokenizer.parameters()) + list(model.encoder.parameters())
     encoder_trainable = sum(p.numel() for p in encoder_params if p.requires_grad)
     probe_trainable = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
     print(
-        f"[{variant}] lr={lr} train_encoder={train_encoder} "
+        f"[{checkpoint_name}] lr={model.hparams.lr} train_encoder={model.train_encoder} "
         f"encoder_trainable={encoder_trainable} probe_trainable={probe_trainable}"
     )
-    if train_encoder and encoder_trainable == 0:
-        raise RuntimeError(f"{variant}: encoder should be trainable but no encoder parameters require grad")
-    if not train_encoder and encoder_trainable != 0:
-        raise RuntimeError(f"{variant}: encoder should be frozen but some encoder parameters require grad")
-    frozen_before = None
-    if not train_encoder:
-        frozen_before = [
-            p.detach().cpu().clone()
-            for p in encoder_params
-        ]
+    if frozen_params and any(p.requires_grad for p in frozen_params):
+        raise RuntimeError(f"{checkpoint_name}: frozen parameters still require grad")
+    frozen_before = [p.detach().cpu().clone() for p in frozen_params]
     trainer = L.Trainer(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
         callbacks=[
             EarlyStopping(monitor="val/mse", patience=cfg.trainer.patience, mode="min"),
-            ModelCheckpoint(monitor="val/mse", mode="min", save_top_k=1, filename=f"next-patch-forecast-{variant}-best"),
+            ModelCheckpoint(monitor="val/mse", mode="min", save_top_k=1, filename=checkpoint_name),
         ],
     )
     trainer.fit(model, dm)
-    if frozen_before is not None:
-        for before, param in zip(frozen_before, encoder_params):
-            if not torch.equal(before, param.detach().cpu()):
-                raise RuntimeError(f"{variant}: frozen encoder/tokenizer parameters changed during training")
-    test_results = trainer.test(model, dataloaders=dm.test_dataloader(), ckpt_path="best")
-
-    # 이후 bench는 best checkpoint 기준으로 수행
-    if trainer.checkpoint_callback.best_model_path:
-        model = NextPatchForecastProbe.load_from_checkpoint(
-            trainer.checkpoint_callback.best_model_path,
-            tokenizer=tokenizer,
-            encoder=encoder,
-            map_location=device,
-        )
-    model.to(device)
-    return model, trainer, dm, device, configured_rollout_steps, test_results
+    for before, param in zip(frozen_before, frozen_params):
+        if not torch.equal(before, param.detach().cpu()):
+            raise RuntimeError(f"{checkpoint_name}: frozen parameters changed during training")
+    best_path = trainer.checkpoint_callback.best_model_path
+    if not best_path:
+        raise RuntimeError(f"{checkpoint_name}: best checkpoint was not saved")
+    return trainer, best_path
 
 
 def do_bench(
@@ -607,6 +532,7 @@ def do_bench(
 @hydra.main(config_path="../../../config", config_name="forecast", version_base=None)
 def main(cfg: DictConfig) -> None:
     L.seed_everything(cfg.trainer.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     report_dir = Path(cfg.report.dir)
     if report_dir == Path("forecast_reports"):
         report_dir = Path("next_patch_forecast_reports")
@@ -622,43 +548,209 @@ def main(cfg: DictConfig) -> None:
                 project_name="BESS-JEPA",
                 task_name="next_patch_forecast",
                 reuse_last_task_id=False,
+                auto_connect_frameworks={"matplotlib": False},
             )
             task.connect(OmegaConf.to_container(cfg, resolve=True))
         except Exception as e:
             print(f"ClearML 사용 불가: {e}")
 
-    # 네 가지 encoder 조건에 대해 같은 downstream 실험 실행
-    variants = [
-        "pretrained_frozen",
-        "random_frozen",
-        "random_supervised",
-        "pretrained_finetune",
-    ]
+    # 공통 checkpoint hparams와 next-patch datamodule 준비
+    jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+    jepa.eval()
+    hp = jepa.hparams
+    seq_len = cfg.data.seq_len or int(hp.seq_len)
+    if seq_len != int(hp.seq_len):
+        raise ValueError(f"Next-patch forecast seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}")
+    configured_rollout_steps = cfg.data.rollout_steps
+    configured_rollout_steps = None if configured_rollout_steps is None else int(configured_rollout_steps)
+    dm = ForecastLoader(
+        data_dir=cfg.data.data_dir,
+        datasets=cfg.data.datasets,
+        seq_len=seq_len,
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        stride=cfg.data.stride,
+        rollout_steps=configured_rollout_steps,
+        rollout_step_size=int(hp.patch_size),
+        processed_dir_name=cfg.data.processed_dir_name,
+    )
+    dm.setup()
+
     comparison: dict[str, dict[str, float]] = {}
     best_paths: dict[str, str] = {}
-    for variant in variants:
+
+    # pretrained_frozen: pretrained tokenizer/encoder를 얼리고 linear next-patch head만 학습
+    L.seed_everything(cfg.trainer.seed)
+    variant = "pretrained_frozen"
+    print(f"\n=== next-patch forecast variant: {variant} ===")
+    variant_dir = report_dir / variant
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    pretrained_frozen_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+    pretrained_frozen_model = NextPatchForecastProbe(
+        tokenizer=pretrained_frozen_jepa.tokenizer,
+        encoder=pretrained_frozen_jepa.encoder,
+        patch_size=int(hp.patch_size),
+        num_channels=int(hp.num_channels),
+        embed_dim=int(hp.embed_dim),
+        train_encoder=False,
+        lr=cfg.probe.lr,
+        weight_decay=cfg.probe.weight_decay,
+    )
+    trainer, pretrained_frozen_ckpt = train(
+        pretrained_frozen_model,
+        dm,
+        cfg,
+        "next-patch-forecast-pretrained_frozen-best",
+        frozen_modules=[pretrained_frozen_model.tokenizer, pretrained_frozen_model.encoder],
+    )
+    pretrained_frozen_best = NextPatchForecastProbe.load_from_checkpoint(
+        pretrained_frozen_ckpt,
+        tokenizer=pretrained_frozen_model.tokenizer,
+        encoder=pretrained_frozen_model.encoder,
+        map_location=device,
+    )
+    pretrained_frozen_best.to(device)
+    test_results = trainer.test(pretrained_frozen_best, dataloaders=dm.test_dataloader())
+    comparison[variant] = do_bench(
+        pretrained_frozen_best, dm, device, configured_rollout_steps, test_results, cfg, variant, task, variant_dir
+    )
+    best_paths[variant] = pretrained_frozen_ckpt
+
+    # random_frozen: random tokenizer/encoder를 얼리고 linear next-patch head만 학습
+    if OmegaConf.select(cfg, "experiments.random_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "random_frozen"
         print(f"\n=== next-patch forecast variant: {variant} ===")
         variant_dir = report_dir / variant
         variant_dir.mkdir(parents=True, exist_ok=True)
-        warm_start_ckpt = best_paths.get("pretrained_frozen") if variant == "pretrained_finetune" else None
-        model, trainer, dm, device, configured_rollout_steps, test_results = train(
-            cfg, variant, warm_start_ckpt=warm_start_ckpt
+        random_frozen_model = NextPatchForecastProbe(
+            tokenizer=Tokenizer(
+                seq_len=int(hp.seq_len),
+                patch_len=int(hp.patch_size),
+                strides=int(hp.strides),
+                n_features=int(hp.num_channels),
+                embed_dim=int(hp.embed_dim),
+            ),
+            encoder=Encoder(
+                embed_dim=int(hp.embed_dim),
+                nhead=int(hp.enc_nhead),
+                num_layers=int(hp.enc_layers),
+            ),
+            patch_size=int(hp.patch_size),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
         )
-        comparison[variant] = do_bench(
-            model,
+        trainer, random_frozen_ckpt = train(
+            random_frozen_model,
             dm,
-            device,
-            configured_rollout_steps,
-            test_results,
             cfg,
-            variant,
-            task,
-            variant_dir,
+            "next-patch-forecast-random_frozen-best",
+            frozen_modules=[random_frozen_model.tokenizer, random_frozen_model.encoder],
         )
-        if trainer.checkpoint_callback.best_model_path:
-            best_paths[variant] = trainer.checkpoint_callback.best_model_path
+        random_frozen_best = NextPatchForecastProbe.load_from_checkpoint(
+            random_frozen_ckpt,
+            tokenizer=random_frozen_model.tokenizer,
+            encoder=random_frozen_model.encoder,
+            map_location=device,
+        )
+        random_frozen_best.to(device)
+        test_results = trainer.test(random_frozen_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(
+            random_frozen_best, dm, device, configured_rollout_steps, test_results, cfg, variant, task, variant_dir
+        )
+        best_paths[variant] = random_frozen_ckpt
+
+    # random_supervised: random tokenizer/encoder와 head를 모두 supervised로 학습
+    if OmegaConf.select(cfg, "experiments.random_supervised", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "random_supervised"
+        print(f"\n=== next-patch forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        random_supervised_model = NextPatchForecastProbe(
+            tokenizer=Tokenizer(
+                seq_len=int(hp.seq_len),
+                patch_len=int(hp.patch_size),
+                strides=int(hp.strides),
+                n_features=int(hp.num_channels),
+                embed_dim=int(hp.embed_dim),
+            ),
+            encoder=Encoder(
+                embed_dim=int(hp.embed_dim),
+                nhead=int(hp.enc_nhead),
+                num_layers=int(hp.enc_layers),
+            ),
+            patch_size=int(hp.patch_size),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=True,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, random_supervised_ckpt = train(
+            random_supervised_model,
+            dm,
+            cfg,
+            "next-patch-forecast-random_supervised-best",
+        )
+        random_supervised_best = NextPatchForecastProbe.load_from_checkpoint(
+            random_supervised_ckpt,
+            tokenizer=random_supervised_model.tokenizer,
+            encoder=random_supervised_model.encoder,
+            map_location=device,
+        )
+        random_supervised_best.to(device)
+        test_results = trainer.test(random_supervised_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(
+            random_supervised_best, dm, device, configured_rollout_steps, test_results, cfg, variant, task, variant_dir
+        )
+        best_paths[variant] = random_supervised_ckpt
+
+    # pretrained_finetune: pretrained_frozen의 학습된 head까지 불러온 뒤 1e-4로 전체 finetuning
+    if OmegaConf.select(cfg, "experiments.pretrained_finetune", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_finetune"
+        print(f"\n=== next-patch forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_finetune_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+        pretrained_finetune_model = NextPatchForecastProbe(
+            tokenizer=pretrained_finetune_jepa.tokenizer,
+            encoder=pretrained_finetune_jepa.encoder,
+            patch_size=int(hp.patch_size),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=True,
+            lr=1e-4,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        checkpoint = torch.load(pretrained_frozen_ckpt, map_location=device, weights_only=False)
+        pretrained_finetune_model.load_state_dict(checkpoint["state_dict"], strict=True)
+        print(f"[{variant}] warm-start from pretrained_frozen checkpoint: {pretrained_frozen_ckpt}")
+        trainer, pretrained_finetune_ckpt = train(
+            pretrained_finetune_model,
+            dm,
+            cfg,
+            "next-patch-forecast-pretrained_finetune-best",
+        )
+        pretrained_finetune_best = NextPatchForecastProbe.load_from_checkpoint(
+            pretrained_finetune_ckpt,
+            tokenizer=pretrained_finetune_model.tokenizer,
+            encoder=pretrained_finetune_model.encoder,
+            map_location=device,
+        )
+        pretrained_finetune_best.to(device)
+        test_results = trainer.test(pretrained_finetune_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(
+            pretrained_finetune_best, dm, device, configured_rollout_steps, test_results, cfg, variant, task, variant_dir
+        )
+        best_paths[variant] = pretrained_finetune_ckpt
 
     # Variant별 scalar 비교 표와 그림 저장
+    variants = list(comparison)
     key_order = sorted({key for metrics in comparison.values() for key in metrics})
     comparison_rows = [
         {"variant": variant, **{key: comparison[variant].get(key, float("nan")) for key in key_order}}

@@ -25,9 +25,12 @@ if __name__ == "__main__":
     # Clearml Task init, Hydra, ...
     
     # 훈련해야하는 여러 모델들에 대해서
+    Load Model
+    Load DataLoader
     ... = train()
     ... = do_bench()
     
+    Load Model
     ... = train()
     ... = do_bench()
     

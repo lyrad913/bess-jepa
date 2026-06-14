@@ -14,6 +14,11 @@ probe:
   lr: 1e-3
   weight_decay: 0.0
 
+experiments:
+  random_frozen: true
+  random_supervised: true
+  pretrained_finetune: true
+
 trainer:
   max_epochs: 100
   accelerator: auto

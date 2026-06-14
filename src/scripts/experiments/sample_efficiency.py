@@ -108,87 +108,26 @@ class SampleEfficiencyProbe(L.LightningModule):
 
 
 def train(
+    model: SampleEfficiencyProbe,
+    dm: ForecastLoader,
     cfg: DictConfig,
-    variant: str,
-    train_fraction: float,
-) -> tuple[SampleEfficiencyProbe, L.Trainer, ForecastLoader, list[dict[str, float]], int, int]:
-    # Forecast datamodule 준비 후 train index만 fraction별로 줄인다.
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
-    jepa.eval()
-    hp = jepa.hparams
-
-    seq_len = cfg.data.seq_len or int(hp.seq_len)
-    if seq_len != int(hp.seq_len):
-        raise ValueError(
-            f"Sample efficiency seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}"
-        )
-
-    dm = ForecastLoader(
-        data_dir=cfg.data.data_dir,
-        datasets=cfg.data.datasets,
-        seq_len=seq_len,
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        stride=cfg.data.stride,
-        rollout_steps=cfg.data.rollout_steps,
-        processed_dir_name=cfg.data.processed_dir_name,
-    )
-    dm.setup()
-    if dm.train_ds is None:
-        raise RuntimeError("ForecastLoader.setup() did not create train dataset")
-
-    full_train_count = len(dm.train_ds)
-    train_count = max(1, int(round(full_train_count * train_fraction)))
-    if train_count < full_train_count:
-        rng = np.random.default_rng(int(cfg.trainer.seed))
-        selected = np.sort(rng.choice(full_train_count, size=train_count, replace=False))
-        dm.train_ds.index = [dm.train_ds.index[int(i)] for i in selected]
-
-    if variant == "pretrained_frozen":
-        tokenizer = jepa.tokenizer
-        encoder = jepa.encoder
-    elif variant == "random_frozen":
-        tokenizer = Tokenizer(
-            seq_len=int(hp.seq_len),
-            patch_len=int(hp.patch_size),
-            strides=int(hp.strides),
-            n_features=int(hp.num_channels),
-            embed_dim=int(hp.embed_dim),
-        )
-        encoder = Encoder(
-            embed_dim=int(hp.embed_dim),
-            nhead=int(hp.enc_nhead),
-            num_layers=int(hp.enc_layers),
-        )
-    else:
-        raise ValueError(f"unknown sample-efficiency variant: {variant}")
-
-    model = SampleEfficiencyProbe(
-        tokenizer=tokenizer,
-        encoder=encoder,
-        seq_len=int(hp.seq_len),
-        patch_size=int(hp.patch_size),
-        strides=int(hp.strides),
-        num_channels=int(hp.num_channels),
-        embed_dim=int(hp.embed_dim),
-        lr=cfg.probe.lr,
-        weight_decay=cfg.probe.weight_decay,
-    )
-
+    checkpoint_name: str,
+    frozen_modules: list[torch.nn.Module],
+) -> tuple[L.Trainer, str]:
+    # 이미 main에서 명시적으로 만든 model과 datamodule을 받아 학습만 수행
     frozen_params = list(model.tokenizer.parameters()) + list(model.encoder.parameters())
     encoder_trainable = sum(p.numel() for p in frozen_params if p.requires_grad)
     probe_trainable = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
     print(
-        f"[{variant} fraction={train_fraction:g}] "
-        f"train_samples={train_count}/{full_train_count} "
+        f"[{checkpoint_name}] lr={model.hparams.lr} "
         f"encoder_trainable={encoder_trainable} probe_trainable={probe_trainable}"
     )
+    if frozen_modules and any(p.requires_grad for module in frozen_modules for p in module.parameters()):
+        raise RuntimeError(f"{checkpoint_name}: frozen parameters still require grad")
     if encoder_trainable != 0:
-        raise RuntimeError(f"{variant}: encoder/tokenizer should be frozen")
+        raise RuntimeError(f"{checkpoint_name}: encoder/tokenizer should be frozen")
     frozen_before = [p.detach().cpu().clone() for p in frozen_params]
 
-    fraction_tag = str(train_fraction).replace(".", "p")
     trainer = L.Trainer(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
@@ -199,25 +138,19 @@ def train(
                 monitor="val/mse",
                 mode="min",
                 save_top_k=1,
-                filename=f"sample-efficiency-{variant}-{fraction_tag}-best",
+                filename=checkpoint_name,
             ),
         ],
     )
     trainer.fit(model, dm)
     for before, param in zip(frozen_before, frozen_params):
         if not torch.equal(before, param.detach().cpu()):
-            raise RuntimeError(f"{variant}: frozen encoder/tokenizer parameters changed during training")
+            raise RuntimeError(f"{checkpoint_name}: frozen encoder/tokenizer parameters changed during training")
 
-    test_results = trainer.test(model, dataloaders=dm.test_dataloader(), ckpt_path="best")
-    if trainer.checkpoint_callback.best_model_path:
-        model = SampleEfficiencyProbe.load_from_checkpoint(
-            trainer.checkpoint_callback.best_model_path,
-            tokenizer=tokenizer,
-            encoder=encoder,
-            map_location=device,
-        )
-    model.to(device)
-    return model, trainer, dm, test_results, train_count, full_train_count
+    best_path = trainer.checkpoint_callback.best_model_path
+    if not best_path:
+        raise RuntimeError(f"{checkpoint_name}: best checkpoint was not saved")
+    return trainer, best_path
 
 
 def do_bench(
@@ -255,9 +188,15 @@ def do_bench(
 @hydra.main(config_path="../../../config", config_name="forecast", version_base=None)
 def main(cfg: DictConfig) -> None:
     L.seed_everything(cfg.trainer.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     fractions = [0.1, 0.25, 0.5, 1.0]
-    variants = ["pretrained_frozen", "random_frozen"]
-    report_dir = Path("sample_efficiency_reports")
+    variants = ["pretrained_frozen"]
+    if OmegaConf.select(cfg, "experiments.random_frozen", default=True):
+        variants.append("random_frozen")
+    checkpoint_path = Path(str(cfg.checkpoint))
+    checkpoint_tag = checkpoint_path.parent.parent.name if checkpoint_path.parent.name == "checkpoints" else checkpoint_path.stem
+    dataset_tag = str(cfg.data.datasets).replace(",", "_")
+    report_dir = Path("sample_efficiency_reports") / dataset_tag / checkpoint_tag
     report_dir.mkdir(parents=True, exist_ok=True)
 
     task = None
@@ -269,35 +208,145 @@ def main(cfg: DictConfig) -> None:
                 project_name="BESS-JEPA",
                 task_name="sample_efficiency",
                 reuse_last_task_id=False,
+                auto_connect_frameworks={"matplotlib": False},
             )
             task.connect(OmegaConf.to_container(cfg, resolve=True))
             task.connect({"sample_efficiency_fractions": fractions})
         except Exception as e:
             print(f"ClearML 사용 불가: {e}")
 
+    # 공통 checkpoint hparams 확인
+    jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+    jepa.eval()
+    hp = jepa.hparams
+    seq_len = cfg.data.seq_len or int(hp.seq_len)
+    if seq_len != int(hp.seq_len):
+        raise ValueError(f"Sample efficiency seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}")
+
     rows: list[dict[str, float]] = []
     best_paths: dict[str, str] = {}
     for fraction in fractions:
-        for variant in variants:
-            print(f"\n=== sample efficiency: {variant}, train_fraction={fraction:g} ===")
-            model, trainer, dm, test_results, train_count, full_train_count = train(
-                cfg,
-                variant,
-                fraction,
-            )
-            del model, dm
-            row = do_bench(
+        fraction_tag = str(fraction).replace(".", "p")
+
+        # fraction별 datamodule을 새로 만들고 train index만 줄인다.
+        dm = ForecastLoader(
+            data_dir=cfg.data.data_dir,
+            datasets=cfg.data.datasets,
+            seq_len=seq_len,
+            batch_size=cfg.data.batch_size,
+            num_workers=cfg.data.num_workers,
+            stride=cfg.data.stride,
+            rollout_steps=cfg.data.rollout_steps,
+            processed_dir_name=cfg.data.processed_dir_name,
+        )
+        dm.setup()
+        if dm.train_ds is None:
+            raise RuntimeError("ForecastLoader.setup() did not create train dataset")
+        full_train_count = len(dm.train_ds)
+        train_count = max(1, int(round(full_train_count * fraction)))
+        if train_count < full_train_count:
+            rng = np.random.default_rng(int(cfg.trainer.seed))
+            selected = np.sort(rng.choice(full_train_count, size=train_count, replace=False))
+            dm.train_ds.index = [dm.train_ds.index[int(i)] for i in selected]
+        print(f"\n=== sample efficiency fraction={fraction:g}: train_samples={train_count}/{full_train_count} ===")
+
+        # pretrained_frozen: pretrained tokenizer/encoder를 얼리고 decoder probe만 학습
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_frozen"
+        print(f"--- {variant} ---")
+        pretrained_frozen_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+        pretrained_frozen_model = SampleEfficiencyProbe(
+            tokenizer=pretrained_frozen_jepa.tokenizer,
+            encoder=pretrained_frozen_jepa.encoder,
+            seq_len=int(hp.seq_len),
+            patch_size=int(hp.patch_size),
+            strides=int(hp.strides),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_frozen_ckpt = train(
+            pretrained_frozen_model,
+            dm,
+            cfg,
+            f"sample-efficiency-pretrained_frozen-{fraction_tag}-best",
+            frozen_modules=[pretrained_frozen_model.tokenizer, pretrained_frozen_model.encoder],
+        )
+        pretrained_frozen_best = SampleEfficiencyProbe.load_from_checkpoint(
+            pretrained_frozen_ckpt,
+            tokenizer=pretrained_frozen_model.tokenizer,
+            encoder=pretrained_frozen_model.encoder,
+            map_location=device,
+        )
+        pretrained_frozen_best.to(device)
+        test_results = trainer.test(pretrained_frozen_best, dataloaders=dm.test_dataloader())
+        rows.append(
+            do_bench(
                 test_results,
                 variant,
                 fraction,
                 train_count,
                 full_train_count,
                 task,
-                report_dir / f"fraction_{str(fraction).replace('.', 'p')}" / variant,
+                report_dir / f"fraction_{fraction_tag}" / variant,
             )
-            rows.append(row)
-            if trainer.checkpoint_callback.best_model_path:
-                best_paths[f"{variant}@{fraction:g}"] = trainer.checkpoint_callback.best_model_path
+        )
+        best_paths[f"{variant}@{fraction:g}"] = pretrained_frozen_ckpt
+
+        # random_frozen: random tokenizer/encoder를 얼리고 decoder probe만 학습
+        if OmegaConf.select(cfg, "experiments.random_frozen", default=True):
+            L.seed_everything(cfg.trainer.seed)
+            variant = "random_frozen"
+            print(f"--- {variant} ---")
+            random_frozen_model = SampleEfficiencyProbe(
+                tokenizer=Tokenizer(
+                    seq_len=int(hp.seq_len),
+                    patch_len=int(hp.patch_size),
+                    strides=int(hp.strides),
+                    n_features=int(hp.num_channels),
+                    embed_dim=int(hp.embed_dim),
+                ),
+                encoder=Encoder(
+                    embed_dim=int(hp.embed_dim),
+                    nhead=int(hp.enc_nhead),
+                    num_layers=int(hp.enc_layers),
+                ),
+                seq_len=int(hp.seq_len),
+                patch_size=int(hp.patch_size),
+                strides=int(hp.strides),
+                num_channels=int(hp.num_channels),
+                embed_dim=int(hp.embed_dim),
+                lr=cfg.probe.lr,
+                weight_decay=cfg.probe.weight_decay,
+            )
+            trainer, random_frozen_ckpt = train(
+                random_frozen_model,
+                dm,
+                cfg,
+                f"sample-efficiency-random_frozen-{fraction_tag}-best",
+                frozen_modules=[random_frozen_model.tokenizer, random_frozen_model.encoder],
+            )
+            random_frozen_best = SampleEfficiencyProbe.load_from_checkpoint(
+                random_frozen_ckpt,
+                tokenizer=random_frozen_model.tokenizer,
+                encoder=random_frozen_model.encoder,
+                map_location=device,
+            )
+            random_frozen_best.to(device)
+            test_results = trainer.test(random_frozen_best, dataloaders=dm.test_dataloader())
+            rows.append(
+                do_bench(
+                    test_results,
+                    variant,
+                    fraction,
+                    train_count,
+                    full_train_count,
+                    task,
+                    report_dir / f"fraction_{fraction_tag}" / variant,
+                )
+            )
+            best_paths[f"{variant}@{fraction:g}"] = random_frozen_ckpt
 
     key_order = sorted({key for row in rows for key in row})
     (report_dir / "comparison_summary.json").write_text(json.dumps(rows, indent=2))
