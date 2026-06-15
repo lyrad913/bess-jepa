@@ -25,11 +25,16 @@ sys.path.insert(0, str(SRC_DIR / "models"))
 sys.path.insert(0, str(SRC_DIR / "data"))
 
 from forecast_loader import FEATURES, ForecastLoader
+from context_mask_projection_jepa import ContextMaskProjectionJEPA
+from hybrid_context_mask_jepa import HybridContextMaskJEPA
+from hybrid_jepa import HybridJEPA
+from hybrid_projection_jepa import HybridProjectionJEPA
 from jepa import JEPA
 from masked_autoencoder import MaskedAutoencoder
 from projection_jepa import ProjectionJEPA
 from sub_models import Decoder, Encoder, Tokenizer
 from ts_jepa import TSJEPA
+from ts_jepa_sigreg import TSJEPASIGReg
 
 
 def assert_encoder_compatible(reference_hp, candidate_hp, variant: str) -> None:
@@ -38,6 +43,29 @@ def assert_encoder_compatible(reference_hp, candidate_hp, variant: str) -> None:
         cand = int(getattr(candidate_hp, key))
         if ref != cand:
             raise ValueError(f"{variant}: checkpoint hparam {key}={cand} does not match JEPA {key}={ref}")
+
+
+def load_reference_pretrain_model(cfg: DictConfig, device: str) -> L.LightningModule:
+    candidates = [
+        ("experiments.pretrained_frozen", "checkpoint", JEPA),
+        ("experiments.pretrained_finetune", "checkpoint", JEPA),
+        ("experiments.pretrained_projection_jepa_frozen", "projection_jepa_checkpoint", ProjectionJEPA),
+        ("experiments.pretrained_hybrid_jepa_frozen", "hybrid_jepa_checkpoint", HybridJEPA),
+        ("experiments.pretrained_hybrid_context_mask_jepa_frozen", "hybrid_context_mask_jepa_checkpoint", HybridContextMaskJEPA),
+        (
+            "experiments.pretrained_context_mask_projection_jepa_frozen",
+            "context_mask_projection_jepa_checkpoint",
+            ContextMaskProjectionJEPA,
+        ),
+        ("experiments.pretrained_hybrid_projection_jepa_frozen", "hybrid_projection_jepa_checkpoint", HybridProjectionJEPA),
+        ("experiments.pretrained_ts_jepa_frozen", "ts_jepa_checkpoint", TSJEPA),
+        ("experiments.pretrained_ts_jepa_sigreg_frozen", "ts_jepa_sigreg_checkpoint", TSJEPASIGReg),
+        ("experiments.pretrained_mae_frozen", "mae_checkpoint", MaskedAutoencoder),
+    ]
+    for flag, checkpoint_key, cls in candidates:
+        if OmegaConf.select(cfg, flag, default=False):
+            return cls.load_from_checkpoint(OmegaConf.select(cfg, checkpoint_key), map_location=device)
+    return JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
 
 
 class ForecastProbe(L.LightningModule):
@@ -541,10 +569,10 @@ def main(cfg: DictConfig) -> None:
         except Exception as e:
             print(f"ClearML 사용 불가: {e}")
 
-    # 공통 checkpoint hparams와 forecasting datamodule 준비
-    jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
-    jepa.eval()
-    hp = jepa.hparams
+    # enabled pretrain checkpoint의 hparams와 forecasting datamodule 준비
+    reference_model = load_reference_pretrain_model(cfg, device)
+    reference_model.eval()
+    hp = reference_model.hparams
     seq_len = cfg.data.seq_len or int(hp.seq_len)
     if seq_len != int(hp.seq_len):
         raise ValueError(f"Forecast seq_len={seq_len} must match checkpoint seq_len={int(hp.seq_len)}")
@@ -564,41 +592,42 @@ def main(cfg: DictConfig) -> None:
     best_paths: dict[str, str] = {}
 
     # pretrained_frozen: pretrained tokenizer/encoder를 얼리고 decoder probe만 학습
-    L.seed_everything(cfg.trainer.seed)
-    variant = "pretrained_frozen"
-    print(f"\n=== forecast variant: {variant} ===")
-    variant_dir = report_dir / variant
-    variant_dir.mkdir(parents=True, exist_ok=True)
-    pretrained_frozen_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
-    pretrained_frozen_model = ForecastProbe(
-        tokenizer=pretrained_frozen_jepa.tokenizer,
-        encoder=pretrained_frozen_jepa.encoder,
-        seq_len=int(hp.seq_len),
-        patch_size=int(hp.patch_size),
-        strides=int(hp.strides),
-        num_channels=int(hp.num_channels),
-        embed_dim=int(hp.embed_dim),
-        train_encoder=False,
-        lr=cfg.probe.lr,
-        weight_decay=cfg.probe.weight_decay,
-    )
-    trainer, pretrained_frozen_ckpt = train(
-        pretrained_frozen_model,
-        dm,
-        cfg,
-        "forecast-pretrained_frozen-best",
-        frozen_modules=[pretrained_frozen_model.tokenizer, pretrained_frozen_model.encoder],
-    )
-    pretrained_frozen_best = ForecastProbe.load_from_checkpoint(
-        pretrained_frozen_ckpt,
-        tokenizer=pretrained_frozen_model.tokenizer,
-        encoder=pretrained_frozen_model.encoder,
-        map_location=device,
-    )
-    pretrained_frozen_best.to(device)
-    test_results = trainer.test(pretrained_frozen_best, dataloaders=dm.test_dataloader())
-    comparison[variant] = do_bench(pretrained_frozen_best, dm, device, test_results, cfg, variant, task, variant_dir)
-    best_paths[variant] = pretrained_frozen_ckpt
+    if OmegaConf.select(cfg, "experiments.pretrained_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_frozen"
+        print(f"\n=== forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_frozen_jepa = JEPA.load_from_checkpoint(cfg.checkpoint, map_location=device)
+        pretrained_frozen_model = ForecastProbe(
+            tokenizer=pretrained_frozen_jepa.tokenizer,
+            encoder=pretrained_frozen_jepa.encoder,
+            seq_len=int(hp.seq_len),
+            patch_size=int(hp.patch_size),
+            strides=int(hp.strides),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_frozen_ckpt = train(
+            pretrained_frozen_model,
+            dm,
+            cfg,
+            "forecast-pretrained_frozen-best",
+            frozen_modules=[pretrained_frozen_model.tokenizer, pretrained_frozen_model.encoder],
+        )
+        pretrained_frozen_best = ForecastProbe.load_from_checkpoint(
+            pretrained_frozen_ckpt,
+            tokenizer=pretrained_frozen_model.tokenizer,
+            encoder=pretrained_frozen_model.encoder,
+            map_location=device,
+        )
+        pretrained_frozen_best.to(device)
+        test_results = trainer.test(pretrained_frozen_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_frozen_best, dm, device, test_results, cfg, variant, task, variant_dir)
+        best_paths[variant] = pretrained_frozen_ckpt
 
     # random_frozen: random tokenizer/encoder를 얼리고 decoder probe만 학습
     if OmegaConf.select(cfg, "experiments.random_frozen", default=True):
@@ -772,6 +801,192 @@ def main(cfg: DictConfig) -> None:
         comparison[variant] = do_bench(pretrained_projection_jepa_best, dm, device, test_results, cfg, variant, task, variant_dir)
         best_paths[variant] = pretrained_projection_jepa_ckpt
 
+    # pretrained_hybrid_jepa_frozen: masked+future hybrid JEPA tokenizer/encoder를 얼리고 decoder probe만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_hybrid_jepa_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_hybrid_jepa_frozen"
+        print(f"\n=== forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_hybrid_jepa = HybridJEPA.load_from_checkpoint(cfg.hybrid_jepa_checkpoint, map_location=device)
+        assert_encoder_compatible(hp, pretrained_hybrid_jepa.hparams, variant)
+        pretrained_hybrid_jepa_model = ForecastProbe(
+            tokenizer=pretrained_hybrid_jepa.tokenizer,
+            encoder=pretrained_hybrid_jepa.encoder,
+            seq_len=int(hp.seq_len),
+            patch_size=int(hp.patch_size),
+            strides=int(hp.strides),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_hybrid_jepa_ckpt = train(
+            pretrained_hybrid_jepa_model,
+            dm,
+            cfg,
+            "forecast-pretrained_hybrid_jepa_frozen-best",
+            frozen_modules=[pretrained_hybrid_jepa_model.tokenizer, pretrained_hybrid_jepa_model.encoder],
+        )
+        pretrained_hybrid_jepa_best = ForecastProbe.load_from_checkpoint(
+            pretrained_hybrid_jepa_ckpt,
+            tokenizer=pretrained_hybrid_jepa_model.tokenizer,
+            encoder=pretrained_hybrid_jepa_model.encoder,
+            map_location=device,
+        )
+        pretrained_hybrid_jepa_best.to(device)
+        test_results = trainer.test(pretrained_hybrid_jepa_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_hybrid_jepa_best, dm, device, test_results, cfg, variant, task, variant_dir)
+        best_paths[variant] = pretrained_hybrid_jepa_ckpt
+
+    # pretrained_hybrid_context_mask_jepa_frozen: future context-masked hybrid JEPA tokenizer/encoder를 얼리고 decoder probe만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_hybrid_context_mask_jepa_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_hybrid_context_mask_jepa_frozen"
+        print(f"\n=== forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_hybrid_context_mask_jepa = HybridContextMaskJEPA.load_from_checkpoint(
+            cfg.hybrid_context_mask_jepa_checkpoint,
+            map_location=device,
+        )
+        assert_encoder_compatible(hp, pretrained_hybrid_context_mask_jepa.hparams, variant)
+        pretrained_hybrid_context_mask_jepa_model = ForecastProbe(
+            tokenizer=pretrained_hybrid_context_mask_jepa.tokenizer,
+            encoder=pretrained_hybrid_context_mask_jepa.encoder,
+            seq_len=int(hp.seq_len),
+            patch_size=int(hp.patch_size),
+            strides=int(hp.strides),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_hybrid_context_mask_jepa_ckpt = train(
+            pretrained_hybrid_context_mask_jepa_model,
+            dm,
+            cfg,
+            "forecast-pretrained_hybrid_context_mask_jepa_frozen-best",
+            frozen_modules=[pretrained_hybrid_context_mask_jepa_model.tokenizer, pretrained_hybrid_context_mask_jepa_model.encoder],
+        )
+        pretrained_hybrid_context_mask_jepa_best = ForecastProbe.load_from_checkpoint(
+            pretrained_hybrid_context_mask_jepa_ckpt,
+            tokenizer=pretrained_hybrid_context_mask_jepa_model.tokenizer,
+            encoder=pretrained_hybrid_context_mask_jepa_model.encoder,
+            map_location=device,
+        )
+        pretrained_hybrid_context_mask_jepa_best.to(device)
+        test_results = trainer.test(pretrained_hybrid_context_mask_jepa_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(
+            pretrained_hybrid_context_mask_jepa_best,
+            dm,
+            device,
+            test_results,
+            cfg,
+            variant,
+            task,
+            variant_dir,
+        )
+        best_paths[variant] = pretrained_hybrid_context_mask_jepa_ckpt
+
+    # pretrained_context_mask_projection_jepa_frozen: context-masked projection-SIGReg JEPA tokenizer/encoder를 얼리고 decoder probe만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_context_mask_projection_jepa_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_context_mask_projection_jepa_frozen"
+        print(f"\n=== forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_context_mask_projection_jepa = ContextMaskProjectionJEPA.load_from_checkpoint(
+            cfg.context_mask_projection_jepa_checkpoint,
+            map_location=device,
+        )
+        assert_encoder_compatible(hp, pretrained_context_mask_projection_jepa.hparams, variant)
+        pretrained_context_mask_projection_jepa_model = ForecastProbe(
+            tokenizer=pretrained_context_mask_projection_jepa.tokenizer,
+            encoder=pretrained_context_mask_projection_jepa.encoder,
+            seq_len=int(hp.seq_len),
+            patch_size=int(hp.patch_size),
+            strides=int(hp.strides),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_context_mask_projection_jepa_ckpt = train(
+            pretrained_context_mask_projection_jepa_model,
+            dm,
+            cfg,
+            "forecast-pretrained_context_mask_projection_jepa_frozen-best",
+            frozen_modules=[
+                pretrained_context_mask_projection_jepa_model.tokenizer,
+                pretrained_context_mask_projection_jepa_model.encoder,
+            ],
+        )
+        pretrained_context_mask_projection_jepa_best = ForecastProbe.load_from_checkpoint(
+            pretrained_context_mask_projection_jepa_ckpt,
+            tokenizer=pretrained_context_mask_projection_jepa_model.tokenizer,
+            encoder=pretrained_context_mask_projection_jepa_model.encoder,
+            map_location=device,
+        )
+        pretrained_context_mask_projection_jepa_best.to(device)
+        test_results = trainer.test(pretrained_context_mask_projection_jepa_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(
+            pretrained_context_mask_projection_jepa_best,
+            dm,
+            device,
+            test_results,
+            cfg,
+            variant,
+            task,
+            variant_dir,
+        )
+        best_paths[variant] = pretrained_context_mask_projection_jepa_ckpt
+
+    # pretrained_hybrid_projection_jepa_frozen: masked+future hybrid projection JEPA tokenizer/encoder를 얼리고 decoder probe만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_hybrid_projection_jepa_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_hybrid_projection_jepa_frozen"
+        print(f"\n=== forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_hybrid_projection_jepa = HybridProjectionJEPA.load_from_checkpoint(
+            cfg.hybrid_projection_jepa_checkpoint,
+            map_location=device,
+        )
+        assert_encoder_compatible(hp, pretrained_hybrid_projection_jepa.hparams, variant)
+        pretrained_hybrid_projection_jepa_model = ForecastProbe(
+            tokenizer=pretrained_hybrid_projection_jepa.tokenizer,
+            encoder=pretrained_hybrid_projection_jepa.encoder,
+            seq_len=int(hp.seq_len),
+            patch_size=int(hp.patch_size),
+            strides=int(hp.strides),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_hybrid_projection_jepa_ckpt = train(
+            pretrained_hybrid_projection_jepa_model,
+            dm,
+            cfg,
+            "forecast-pretrained_hybrid_projection_jepa_frozen-best",
+            frozen_modules=[pretrained_hybrid_projection_jepa_model.tokenizer, pretrained_hybrid_projection_jepa_model.encoder],
+        )
+        pretrained_hybrid_projection_jepa_best = ForecastProbe.load_from_checkpoint(
+            pretrained_hybrid_projection_jepa_ckpt,
+            tokenizer=pretrained_hybrid_projection_jepa_model.tokenizer,
+            encoder=pretrained_hybrid_projection_jepa_model.encoder,
+            map_location=device,
+        )
+        pretrained_hybrid_projection_jepa_best.to(device)
+        test_results = trainer.test(pretrained_hybrid_projection_jepa_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_hybrid_projection_jepa_best, dm, device, test_results, cfg, variant, task, variant_dir)
+        best_paths[variant] = pretrained_hybrid_projection_jepa_ckpt
+
     # pretrained_ts_jepa_frozen: pretrained TS-JEPA tokenizer/encoder를 얼리고 decoder probe만 학습
     if OmegaConf.select(cfg, "experiments.pretrained_ts_jepa_frozen", default=True):
         L.seed_everything(cfg.trainer.seed)
@@ -810,6 +1025,45 @@ def main(cfg: DictConfig) -> None:
         test_results = trainer.test(pretrained_ts_jepa_best, dataloaders=dm.test_dataloader())
         comparison[variant] = do_bench(pretrained_ts_jepa_best, dm, device, test_results, cfg, variant, task, variant_dir)
         best_paths[variant] = pretrained_ts_jepa_ckpt
+
+    # pretrained_ts_jepa_sigreg_frozen: EMA 없이 SIGReg로 학습한 TS-JEPA encoder를 얼리고 decoder probe만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_ts_jepa_sigreg_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_ts_jepa_sigreg_frozen"
+        print(f"\n=== forecast variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_ts_jepa_sigreg = TSJEPASIGReg.load_from_checkpoint(cfg.ts_jepa_sigreg_checkpoint, map_location=device)
+        assert_encoder_compatible(hp, pretrained_ts_jepa_sigreg.hparams, variant)
+        pretrained_ts_jepa_sigreg_model = ForecastProbe(
+            tokenizer=pretrained_ts_jepa_sigreg.tokenizer,
+            encoder=pretrained_ts_jepa_sigreg.encoder,
+            seq_len=int(hp.seq_len),
+            patch_size=int(hp.patch_size),
+            strides=int(hp.strides),
+            num_channels=int(hp.num_channels),
+            embed_dim=int(hp.embed_dim),
+            train_encoder=False,
+            lr=cfg.probe.lr,
+            weight_decay=cfg.probe.weight_decay,
+        )
+        trainer, pretrained_ts_jepa_sigreg_ckpt = train(
+            pretrained_ts_jepa_sigreg_model,
+            dm,
+            cfg,
+            "forecast-pretrained_ts_jepa_sigreg_frozen-best",
+            frozen_modules=[pretrained_ts_jepa_sigreg_model.tokenizer, pretrained_ts_jepa_sigreg_model.encoder],
+        )
+        pretrained_ts_jepa_sigreg_best = ForecastProbe.load_from_checkpoint(
+            pretrained_ts_jepa_sigreg_ckpt,
+            tokenizer=pretrained_ts_jepa_sigreg_model.tokenizer,
+            encoder=pretrained_ts_jepa_sigreg_model.encoder,
+            map_location=device,
+        )
+        pretrained_ts_jepa_sigreg_best.to(device)
+        test_results = trainer.test(pretrained_ts_jepa_sigreg_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_ts_jepa_sigreg_best, dm, device, test_results, cfg, variant, task, variant_dir)
+        best_paths[variant] = pretrained_ts_jepa_sigreg_ckpt
 
     # pretrained_mae_frozen: pretrained MAE tokenizer/encoder를 얼리고 decoder probe만 학습
     if OmegaConf.select(cfg, "experiments.pretrained_mae_frozen", default=True):

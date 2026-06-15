@@ -12,6 +12,8 @@ lightning_logs/
 src/scripts/run_overnight.sh
 .gitignore
 logs/
+/paper/
+/experiment_*.csv
 
 # Virtual environments
 .venv

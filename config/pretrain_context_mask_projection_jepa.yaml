@@ -16,23 +16,22 @@ model:
   strides: 32
   num_channels: 3
   embed_dim: 128
-  enc_nhead: 2
-  enc_layers: 1
-  pred_nhead: 2
+  enc_nhead: 4
+  enc_layers: 2
+  pred_nhead: 4
   pred_layers: 1
-  mask_ratio: 0.7
-  ema_momentum: 0.998
-  sigreg_lambda: 0.0
+  sigreg_lambda: 0.1
   sigreg_knots: 17
   sigreg_num_proj: 1024
-  lr: 1e-7
-  weight_decay: 0.00
+  lr: 3e-4
+  weight_decay: 1e-3
   warmup_epochs: 10
+  future_context_mask_ratio: 0.7
+  projection_hidden_scale: 4
 
 trainer:
   max_epochs: 1000
   accelerator: auto
   devices: auto
-  patience: 30
+  patience: 100
   seed: 42
-
