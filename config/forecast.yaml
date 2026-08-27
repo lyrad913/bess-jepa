@@ -1,9 +1,10 @@
 checkpoint: ???
 projection_jepa_checkpoint: ???
-hybrid_jepa_checkpoint: ???
-hybrid_context_mask_jepa_checkpoint: ???
+context_mask_jepa_checkpoint: ???
 context_mask_projection_jepa_checkpoint: ???
-hybrid_projection_jepa_checkpoint: ???
+context_mask_projection_jepa_probe_checkpoint: null
+context_query_projection_jepa_checkpoint: ???
+context_query_projection_jepa_probe_checkpoint: null
 ts_jepa_checkpoint: ???
 ts_jepa_sigreg_checkpoint: ???
 mae_checkpoint: ???
@@ -28,10 +29,11 @@ experiments:
   random_supervised: true
   pretrained_finetune: true
   pretrained_projection_jepa_frozen: true
-  pretrained_hybrid_jepa_frozen: true
-  pretrained_hybrid_context_mask_jepa_frozen: true
+  pretrained_context_mask_jepa_frozen: true
   pretrained_context_mask_projection_jepa_frozen: true
-  pretrained_hybrid_projection_jepa_frozen: true
+  pretrained_context_mask_projection_jepa_finetune: true
+  pretrained_context_query_projection_jepa_frozen: true
+  pretrained_context_query_projection_jepa_finetune: true
   pretrained_ts_jepa_frozen: true
   pretrained_ts_jepa_sigreg_frozen: true
   pretrained_mae_frozen: true

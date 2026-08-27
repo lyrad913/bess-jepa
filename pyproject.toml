@@ -22,4 +22,5 @@ dependencies = [
     "tensorboard>=2.20.0",
     "transformers>=5.9.0",
     "scikit-learn>=1.8.0",
+    "umap-learn>=0.5.12",
 ]

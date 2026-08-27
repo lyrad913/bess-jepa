@@ -27,6 +27,7 @@ model:
   weight_decay: 1e-3
   warmup_epochs: 10
   future_context_mask_ratio: 0.7
+  projection_hidden_scale: 4
 
 trainer:
   max_epochs: 1000
@@ -34,4 +35,3 @@ trainer:
   devices: auto
   patience: 100
   seed: 42
-

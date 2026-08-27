@@ -26,10 +26,9 @@ sys.path.insert(0, str(SRC_DIR / "models"))
 sys.path.insert(0, str(SRC_DIR / "data"))
 
 from forecast_soh_loader import ForecastSohLoader
+from context_query_projection_jepa import ContextQueryProjectionJEPA
 from context_mask_projection_jepa import ContextMaskProjectionJEPA
-from hybrid_context_mask_jepa import HybridContextMaskJEPA
-from hybrid_jepa import HybridJEPA
-from hybrid_projection_jepa import HybridProjectionJEPA
+from context_mask_jepa import ContextMaskJEPA
 from jepa import JEPA
 from masked_autoencoder import MaskedAutoencoder
 from projection_jepa import ProjectionJEPA
@@ -53,14 +52,27 @@ def load_reference_pretrain_model(cfg: DictConfig, device: str) -> L.LightningMo
         ("experiments.pretrained_frozen", "checkpoint", JEPA),
         ("experiments.pretrained_finetune", "checkpoint", JEPA),
         ("experiments.pretrained_projection_jepa_frozen", "projection_jepa_checkpoint", ProjectionJEPA),
-        ("experiments.pretrained_hybrid_jepa_frozen", "hybrid_jepa_checkpoint", HybridJEPA),
-        ("experiments.pretrained_hybrid_context_mask_jepa_frozen", "hybrid_context_mask_jepa_checkpoint", HybridContextMaskJEPA),
+        ("experiments.pretrained_context_mask_jepa_frozen", "context_mask_jepa_checkpoint", ContextMaskJEPA),
         (
             "experiments.pretrained_context_mask_projection_jepa_frozen",
             "context_mask_projection_jepa_checkpoint",
             ContextMaskProjectionJEPA,
         ),
-        ("experiments.pretrained_hybrid_projection_jepa_frozen", "hybrid_projection_jepa_checkpoint", HybridProjectionJEPA),
+        (
+            "experiments.pretrained_context_mask_projection_jepa_finetune",
+            "context_mask_projection_jepa_checkpoint",
+            ContextMaskProjectionJEPA,
+        ),
+        (
+            "experiments.pretrained_context_query_projection_jepa_frozen",
+            "context_query_projection_jepa_checkpoint",
+            ContextQueryProjectionJEPA,
+        ),
+        (
+            "experiments.pretrained_context_query_projection_jepa_finetune",
+            "context_query_projection_jepa_checkpoint",
+            ContextQueryProjectionJEPA,
+        ),
         ("experiments.pretrained_ts_jepa_frozen", "ts_jepa_checkpoint", TSJEPA),
         ("experiments.pretrained_ts_jepa_sigreg_frozen", "ts_jepa_sigreg_checkpoint", TSJEPASIGReg),
         ("experiments.pretrained_mae_frozen", "mae_checkpoint", MaskedAutoencoder),
@@ -732,93 +744,52 @@ def main(cfg: DictConfig) -> None:
             comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
         best_paths[variant] = pretrained_projection_jepa_ckpt
 
-    # pretrained_hybrid_jepa_frozen: masked+future hybrid JEPA tokenizer/encoder를 얼리고 SoH head만 학습
-    if OmegaConf.select(cfg, "experiments.pretrained_hybrid_jepa_frozen", default=True):
+    # pretrained_context_mask_jepa_frozen: 미래 예측 context-masked JEPA tokenizer/encoder를 얼리고 SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_context_mask_jepa_frozen", default=True):
         L.seed_everything(cfg.trainer.seed)
-        variant = "pretrained_hybrid_jepa_frozen"
+        variant = "pretrained_context_mask_jepa_frozen"
         print(f"\n=== forecast SoH variant: {variant} ===")
         variant_dir = report_dir / variant
         variant_dir.mkdir(parents=True, exist_ok=True)
-        pretrained_hybrid_jepa = HybridJEPA.load_from_checkpoint(cfg.hybrid_jepa_checkpoint, map_location=device)
-        assert_encoder_compatible(hp, pretrained_hybrid_jepa.hparams, variant)
-        pretrained_hybrid_jepa_model = ForecastSohProbe(
-            tokenizer=pretrained_hybrid_jepa.tokenizer,
-            encoder=pretrained_hybrid_jepa.encoder,
+        pretrained_context_mask_jepa = ContextMaskJEPA.load_from_checkpoint(
+            cfg.context_mask_jepa_checkpoint,
+            map_location=device,
+        )
+        assert_encoder_compatible(hp, pretrained_context_mask_jepa.hparams, variant)
+        pretrained_context_mask_jepa_model = ForecastSohProbe(
+            tokenizer=pretrained_context_mask_jepa.tokenizer,
+            encoder=pretrained_context_mask_jepa.encoder,
             embed_dim=int(hp.embed_dim),
             train_encoder=False,
             lr=cfg.probe.lr,
             weight_decay=cfg.probe.weight_decay,
             dt_scale=cfg.data.dt_scale,
         )
-        trainer, pretrained_hybrid_jepa_ckpt = train(
-            pretrained_hybrid_jepa_model,
+        trainer, pretrained_context_mask_jepa_ckpt = train(
+            pretrained_context_mask_jepa_model,
             dm,
             cfg,
-            "forecast-soh-pretrained_hybrid_jepa_frozen-best",
-            frozen_modules=[pretrained_hybrid_jepa_model.tokenizer, pretrained_hybrid_jepa_model.encoder],
-        )
-        pretrained_hybrid_jepa_best = ForecastSohProbe.load_from_checkpoint(
-            pretrained_hybrid_jepa_ckpt,
-            tokenizer=pretrained_hybrid_jepa_model.tokenizer,
-            encoder=pretrained_hybrid_jepa_model.encoder,
-            map_location=device,
-        )
-        pretrained_hybrid_jepa_best.to(device)
-        test_results = trainer.test(pretrained_hybrid_jepa_best, dataloaders=dm.test_dataloader())
-        comparison[variant] = do_bench(pretrained_hybrid_jepa_best, dm, device, variant, task, variant_dir)
-        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
-        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
-        if test_results:
-            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
-            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
-        best_paths[variant] = pretrained_hybrid_jepa_ckpt
-
-    # pretrained_hybrid_context_mask_jepa_frozen: 미래 예측 context-masked hybrid JEPA tokenizer/encoder를 얼리고 SoH head만 학습
-    if OmegaConf.select(cfg, "experiments.pretrained_hybrid_context_mask_jepa_frozen", default=True):
-        L.seed_everything(cfg.trainer.seed)
-        variant = "pretrained_hybrid_context_mask_jepa_frozen"
-        print(f"\n=== forecast SoH variant: {variant} ===")
-        variant_dir = report_dir / variant
-        variant_dir.mkdir(parents=True, exist_ok=True)
-        pretrained_hybrid_context_mask_jepa = HybridContextMaskJEPA.load_from_checkpoint(
-            cfg.hybrid_context_mask_jepa_checkpoint,
-            map_location=device,
-        )
-        assert_encoder_compatible(hp, pretrained_hybrid_context_mask_jepa.hparams, variant)
-        pretrained_hybrid_context_mask_jepa_model = ForecastSohProbe(
-            tokenizer=pretrained_hybrid_context_mask_jepa.tokenizer,
-            encoder=pretrained_hybrid_context_mask_jepa.encoder,
-            embed_dim=int(hp.embed_dim),
-            train_encoder=False,
-            lr=cfg.probe.lr,
-            weight_decay=cfg.probe.weight_decay,
-            dt_scale=cfg.data.dt_scale,
-        )
-        trainer, pretrained_hybrid_context_mask_jepa_ckpt = train(
-            pretrained_hybrid_context_mask_jepa_model,
-            dm,
-            cfg,
-            "forecast-soh-pretrained_hybrid_context_mask_jepa_frozen-best",
+            "forecast-soh-pretrained_context_mask_jepa_frozen-best",
             frozen_modules=[
-                pretrained_hybrid_context_mask_jepa_model.tokenizer,
-                pretrained_hybrid_context_mask_jepa_model.encoder,
+                pretrained_context_mask_jepa_model.tokenizer,
+                pretrained_context_mask_jepa_model.encoder,
             ],
         )
-        pretrained_hybrid_context_mask_jepa_best = ForecastSohProbe.load_from_checkpoint(
-            pretrained_hybrid_context_mask_jepa_ckpt,
-            tokenizer=pretrained_hybrid_context_mask_jepa_model.tokenizer,
-            encoder=pretrained_hybrid_context_mask_jepa_model.encoder,
+        pretrained_context_mask_jepa_best = ForecastSohProbe.load_from_checkpoint(
+            pretrained_context_mask_jepa_ckpt,
+            tokenizer=pretrained_context_mask_jepa_model.tokenizer,
+            encoder=pretrained_context_mask_jepa_model.encoder,
             map_location=device,
         )
-        pretrained_hybrid_context_mask_jepa_best.to(device)
-        test_results = trainer.test(pretrained_hybrid_context_mask_jepa_best, dataloaders=dm.test_dataloader())
-        comparison[variant] = do_bench(pretrained_hybrid_context_mask_jepa_best, dm, device, variant, task, variant_dir)
+        pretrained_context_mask_jepa_best.to(device)
+        test_results = trainer.test(pretrained_context_mask_jepa_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(pretrained_context_mask_jepa_best, dm, device, variant, task, variant_dir)
         comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
         comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
         if test_results:
             comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
             comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
-        best_paths[variant] = pretrained_hybrid_context_mask_jepa_ckpt
+        best_paths[variant] = pretrained_context_mask_jepa_ckpt
 
     # pretrained_context_mask_projection_jepa_frozen: context-masked projection-SIGReg JEPA tokenizer/encoder를 얼리고 SoH head만 학습
     if OmegaConf.select(cfg, "experiments.pretrained_context_mask_projection_jepa_frozen", default=True):
@@ -867,49 +838,164 @@ def main(cfg: DictConfig) -> None:
             comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
         best_paths[variant] = pretrained_context_mask_projection_jepa_ckpt
 
-    # pretrained_hybrid_projection_jepa_frozen: masked+future hybrid projection JEPA tokenizer/encoder를 얼리고 SoH head만 학습
-    if OmegaConf.select(cfg, "experiments.pretrained_hybrid_projection_jepa_frozen", default=True):
+    # pretrained_context_mask_projection_jepa_finetune: frozen encoder + SoH head 학습 checkpoint에서 전체 finetuning
+    if OmegaConf.select(cfg, "experiments.pretrained_context_mask_projection_jepa_finetune", default=True):
+        warm_start_ckpt = OmegaConf.select(cfg, "context_mask_projection_jepa_probe_checkpoint")
+        if warm_start_ckpt is None:
+            warm_start_ckpt = best_paths.get("pretrained_context_mask_projection_jepa_frozen")
+        if warm_start_ckpt is None:
+            raise RuntimeError(
+                "pretrained_context_mask_projection_jepa_finetune requires "
+                "context_mask_projection_jepa_probe_checkpoint or "
+                "experiments.pretrained_context_mask_projection_jepa_frozen=true"
+            )
         L.seed_everything(cfg.trainer.seed)
-        variant = "pretrained_hybrid_projection_jepa_frozen"
+        variant = "pretrained_context_mask_projection_jepa_finetune"
         print(f"\n=== forecast SoH variant: {variant} ===")
         variant_dir = report_dir / variant
         variant_dir.mkdir(parents=True, exist_ok=True)
-        pretrained_hybrid_projection_jepa = HybridProjectionJEPA.load_from_checkpoint(
-            cfg.hybrid_projection_jepa_checkpoint,
+        pretrained_context_mask_projection_jepa = ContextMaskProjectionJEPA.load_from_checkpoint(
+            cfg.context_mask_projection_jepa_checkpoint,
             map_location=device,
         )
-        assert_encoder_compatible(hp, pretrained_hybrid_projection_jepa.hparams, variant)
-        pretrained_hybrid_projection_jepa_model = ForecastSohProbe(
-            tokenizer=pretrained_hybrid_projection_jepa.tokenizer,
-            encoder=pretrained_hybrid_projection_jepa.encoder,
+        assert_encoder_compatible(hp, pretrained_context_mask_projection_jepa.hparams, variant)
+        pretrained_context_mask_projection_jepa_model = ForecastSohProbe(
+            tokenizer=pretrained_context_mask_projection_jepa.tokenizer,
+            encoder=pretrained_context_mask_projection_jepa.encoder,
+            embed_dim=int(hp.embed_dim),
+            train_encoder=True,
+            lr=1e-4,
+            weight_decay=cfg.probe.weight_decay,
+            dt_scale=cfg.data.dt_scale,
+        )
+        checkpoint = torch.load(warm_start_ckpt, map_location=device, weights_only=False)
+        pretrained_context_mask_projection_jepa_model.load_state_dict(checkpoint["state_dict"], strict=True)
+        print(f"[{variant}] warm-start from frozen-encoder probe checkpoint: {warm_start_ckpt}")
+        trainer, pretrained_context_mask_projection_jepa_finetune_ckpt = train(
+            pretrained_context_mask_projection_jepa_model,
+            dm,
+            cfg,
+            "forecast-soh-pretrained_context_mask_projection_jepa_finetune-best",
+        )
+        pretrained_context_mask_projection_jepa_finetune_best = ForecastSohProbe.load_from_checkpoint(
+            pretrained_context_mask_projection_jepa_finetune_ckpt,
+            tokenizer=pretrained_context_mask_projection_jepa_model.tokenizer,
+            encoder=pretrained_context_mask_projection_jepa_model.encoder,
+            map_location=device,
+        )
+        pretrained_context_mask_projection_jepa_finetune_best.to(device)
+        test_results = trainer.test(pretrained_context_mask_projection_jepa_finetune_best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(
+            pretrained_context_mask_projection_jepa_finetune_best,
+            dm,
+            device,
+            variant,
+            task,
+            variant_dir,
+        )
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = pretrained_context_mask_projection_jepa_finetune_ckpt
+
+    # pretrained_context_query_projection_jepa_frozen: query-projection JEPA encoder를 얼리고 SoH head만 학습
+    if OmegaConf.select(cfg, "experiments.pretrained_context_query_projection_jepa_frozen", default=True):
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_context_query_projection_jepa_frozen"
+        print(f"\n=== forecast SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained = ContextQueryProjectionJEPA.load_from_checkpoint(
+            cfg.context_query_projection_jepa_checkpoint, map_location=device
+        )
+        assert_encoder_compatible(hp, pretrained.hparams, variant)
+        model = ForecastSohProbe(
+            tokenizer=pretrained.tokenizer,
+            encoder=pretrained.encoder,
             embed_dim=int(hp.embed_dim),
             train_encoder=False,
             lr=cfg.probe.lr,
             weight_decay=cfg.probe.weight_decay,
             dt_scale=cfg.data.dt_scale,
         )
-        trainer, pretrained_hybrid_projection_jepa_ckpt = train(
-            pretrained_hybrid_projection_jepa_model,
+        trainer, probe_ckpt = train(
+            model,
             dm,
             cfg,
-            "forecast-soh-pretrained_hybrid_projection_jepa_frozen-best",
-            frozen_modules=[pretrained_hybrid_projection_jepa_model.tokenizer, pretrained_hybrid_projection_jepa_model.encoder],
+            "forecast-soh-pretrained_context_query_projection_jepa_frozen-best",
+            frozen_modules=[model.tokenizer, model.encoder],
         )
-        pretrained_hybrid_projection_jepa_best = ForecastSohProbe.load_from_checkpoint(
-            pretrained_hybrid_projection_jepa_ckpt,
-            tokenizer=pretrained_hybrid_projection_jepa_model.tokenizer,
-            encoder=pretrained_hybrid_projection_jepa_model.encoder,
+        best = ForecastSohProbe.load_from_checkpoint(
+            probe_ckpt,
+            tokenizer=model.tokenizer,
+            encoder=model.encoder,
             map_location=device,
         )
-        pretrained_hybrid_projection_jepa_best.to(device)
-        test_results = trainer.test(pretrained_hybrid_projection_jepa_best, dataloaders=dm.test_dataloader())
-        comparison[variant] = do_bench(pretrained_hybrid_projection_jepa_best, dm, device, variant, task, variant_dir)
+        best.to(device)
+        test_results = trainer.test(best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(best, dm, device, variant, task, variant_dir)
         comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
         comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
         if test_results:
             comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
             comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
-        best_paths[variant] = pretrained_hybrid_projection_jepa_ckpt
+        best_paths[variant] = probe_ckpt
+
+    # pretrained_context_query_projection_jepa_finetune: frozen probe checkpoint에서 전체 finetuning
+    if OmegaConf.select(cfg, "experiments.pretrained_context_query_projection_jepa_finetune", default=True):
+        warm_start_ckpt = OmegaConf.select(cfg, "context_query_projection_jepa_probe_checkpoint")
+        if warm_start_ckpt is None:
+            warm_start_ckpt = best_paths.get("pretrained_context_query_projection_jepa_frozen")
+        if warm_start_ckpt is None:
+            raise RuntimeError(
+                "pretrained_context_query_projection_jepa_finetune requires "
+                "context_query_projection_jepa_probe_checkpoint or "
+                "experiments.pretrained_context_query_projection_jepa_frozen=true"
+            )
+        L.seed_everything(cfg.trainer.seed)
+        variant = "pretrained_context_query_projection_jepa_finetune"
+        print(f"\n=== forecast SoH variant: {variant} ===")
+        variant_dir = report_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pretrained = ContextQueryProjectionJEPA.load_from_checkpoint(
+            cfg.context_query_projection_jepa_checkpoint, map_location=device
+        )
+        assert_encoder_compatible(hp, pretrained.hparams, variant)
+        model = ForecastSohProbe(
+            tokenizer=pretrained.tokenizer,
+            encoder=pretrained.encoder,
+            embed_dim=int(hp.embed_dim),
+            train_encoder=True,
+            lr=1e-4,
+            weight_decay=cfg.probe.weight_decay,
+            dt_scale=cfg.data.dt_scale,
+        )
+        checkpoint = torch.load(warm_start_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        print(f"[{variant}] warm-start from frozen-encoder probe checkpoint: {warm_start_ckpt}")
+        trainer, finetune_ckpt = train(
+            model,
+            dm,
+            cfg,
+            "forecast-soh-pretrained_context_query_projection_jepa_finetune-best",
+        )
+        best = ForecastSohProbe.load_from_checkpoint(
+            finetune_ckpt,
+            tokenizer=model.tokenizer,
+            encoder=model.encoder,
+            map_location=device,
+        )
+        best.to(device)
+        test_results = trainer.test(best, dataloaders=dm.test_dataloader())
+        comparison[variant] = do_bench(best, dm, device, variant, task, variant_dir)
+        comparison[variant]["best/val_rmse"] = float(trainer.checkpoint_callback.best_model_score.detach().cpu())
+        comparison[variant]["fit/current_epoch"] = float(trainer.current_epoch)
+        if test_results:
+            comparison[variant]["lightning/test_rmse"] = float(test_results[0].get("test/rmse", float("nan")))
+            comparison[variant]["lightning/test_mae"] = float(test_results[0].get("test/mae", float("nan")))
+        best_paths[variant] = finetune_ckpt
 
     # pretrained_ts_jepa_frozen: pretrained TS-JEPA tokenizer/encoder를 얼리고 SoH head만 학습
     if OmegaConf.select(cfg, "experiments.pretrained_ts_jepa_frozen", default=True):

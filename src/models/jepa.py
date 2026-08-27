@@ -164,7 +164,13 @@ class JEPA(L.LightningModule):
         ax.set_xlabel(f"PC1 ({var_ratio[0]:.1%})")
         ax.set_ylabel(f"PC2 ({var_ratio[1]:.1%})")
         ax.set_title(f"{title} embedding PCA  epoch={step}  eff_rank={eff_rank:.1f}")
-        cl_logger.report_matplotlib_figure(section, f"PCA{series_suffix}", fig, step)
+        cl_logger.report_matplotlib_figure(
+            section,
+            f"PCA{series_suffix}",
+            fig,
+            step,
+            report_interactive=False,
+        )
         plt.close(fig)
 
         # 2. Per-dim std sorted descending – dead dims show up as near-zero tail
